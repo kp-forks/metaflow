@@ -1,30 +1,30 @@
+import base64
 import os
 import re
 import sys
-import base64
+from hashlib import sha1
+
 from metaflow import current, decorators
 from metaflow._vendor import click
 from metaflow.exception import MetaflowException, MetaflowInternalError
 from metaflow.package import MetaflowPackage
-from hashlib import sha1
+from metaflow.plugins.aws.step_functions.production_token import (
+    load_token,
+    new_token,
+    store_token,
+)
 from metaflow.plugins.kubernetes.kubernetes_decorator import KubernetesDecorator
 from metaflow.util import get_username, to_bytes, to_unicode
 
 from .airflow import Airflow
 from .exception import AirflowException, NotSupportedException
 
-from metaflow.plugins.aws.step_functions.production_token import (
-    load_token,
-    new_token,
-    store_token,
-)
-
 
 class IncorrectProductionToken(MetaflowException):
     headline = "Incorrect production token"
 
 
-VALID_NAME = re.compile("[^a-zA-Z0-9_\-\.]")
+VALID_NAME = re.compile(r"[^a-zA-Z0-9_\-\.]")
 
 
 def resolve_token(
@@ -283,6 +283,7 @@ def make_flow(
 ):
     # Attach @kubernetes.
     decorators._attach_decorators(obj.flow, [KubernetesDecorator.name])
+    decorators._init(obj.flow)
 
     decorators._init_step_decorators(
         obj.flow, obj.graph, obj.environment, obj.flow_datastore, obj.logger
@@ -372,9 +373,9 @@ def _validate_workflow(flow, graph, flow_datastore, metadata, workflow_timeout):
         seen.add(norm)
         if "default" not in param.kwargs:
             raise MetaflowException(
-                "Parameter *%s* does not have a "
-                "default value. "
+                "Parameter *%s* does not have a default value. "
                 "A default value is required for parameters when deploying flows on Airflow."
+                % param.name
             )
     # check for other compute related decorators.
     _validate_foreach_constraints(graph)
@@ -387,6 +388,11 @@ def _validate_workflow(flow, graph, flow_datastore, metadata, workflow_timeout):
         if any([d.name == "batch" for d in node.decorators]):
             raise NotSupportedException(
                 "Step *%s* is marked for execution on AWS Batch with Airflow which isn't currently supported."
+                % node.name
+            )
+        if any([d.name == "slurm" for d in node.decorators]):
+            raise NotSupportedException(
+                "Step *%s* is marked for execution on Slurm with Airflow which isn't currently supported."
                 % node.name
             )
     SUPPORTED_DATASTORES = ("azure", "s3", "gs")

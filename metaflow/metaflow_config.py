@@ -1,9 +1,6 @@
-import logging
 import os
 import sys
 import types
-
-import pkg_resources
 
 from metaflow.exception import MetaflowException
 from metaflow.metaflow_config_funcs import from_conf, get_validate_choice_fn
@@ -18,6 +15,16 @@ if sys.platform == "darwin":
 ## value, either set `METAFLOW_DEFAULT_DATASTORE` in your configuration file or set
 ## an environment variable called `METAFLOW_DEFAULT_DATASTORE`
 
+##
+# Constants (NOTE: these need to live before any from_conf)
+##
+
+# Path to the local directory to store artifacts for 'local' datastore.
+DATASTORE_LOCAL_DIR = ".metaflow"
+
+# Local configuration file (in .metaflow) containing overrides per-project
+LOCAL_CONFIG_FILE = "config.json"
+
 ###
 # Default configuration
 ###
@@ -29,14 +36,26 @@ DEFAULT_METADATA = from_conf("DEFAULT_METADATA", "local")
 DEFAULT_MONITOR = from_conf("DEFAULT_MONITOR", "nullSidecarMonitor")
 DEFAULT_PACKAGE_SUFFIXES = from_conf("DEFAULT_PACKAGE_SUFFIXES", ".py,.R,.RDS")
 DEFAULT_AWS_CLIENT_PROVIDER = from_conf("DEFAULT_AWS_CLIENT_PROVIDER", "boto3")
+DEFAULT_AZURE_CLIENT_PROVIDER = from_conf(
+    "DEFAULT_AZURE_CLIENT_PROVIDER", "azure-default"
+)
+DEFAULT_GCP_CLIENT_PROVIDER = from_conf("DEFAULT_GCP_CLIENT_PROVIDER", "gcp-default")
 DEFAULT_SECRETS_BACKEND_TYPE = from_conf("DEFAULT_SECRETS_BACKEND_TYPE")
+DEFAULT_SECRETS_ROLE = from_conf("DEFAULT_SECRETS_ROLE")
+
+DEFAULT_FROM_DEPLOYMENT_IMPL = from_conf(
+    "DEFAULT_FROM_DEPLOYMENT_IMPL", "argo-workflows"
+)
+
+###
+# User configuration
+###
+USER = from_conf("USER")
 
 
 ###
 # Datastore configuration
 ###
-# Path to the local directory to store artifacts for 'local' datastore.
-DATASTORE_LOCAL_DIR = ".metaflow"
 DATASTORE_SYSROOT_LOCAL = from_conf("DATASTORE_SYSROOT_LOCAL")
 # S3 bucket and prefix to store artifacts for 's3' datastore.
 DATASTORE_SYSROOT_S3 = from_conf("DATASTORE_SYSROOT_S3")
@@ -69,11 +88,17 @@ CLIENT_CACHE_MAX_TASKDATASTORE_COUNT = from_conf(
 S3_ENDPOINT_URL = from_conf("S3_ENDPOINT_URL")
 S3_VERIFY_CERTIFICATE = from_conf("S3_VERIFY_CERTIFICATE")
 
+# Set ServerSideEncryption for S3 uploads
+S3_SERVER_SIDE_ENCRYPTION = from_conf("S3_SERVER_SIDE_ENCRYPTION")
+
 # S3 retry configuration
 # This is useful if you want to "fail fast" on S3 operations; use with caution
 # though as this may increase failures. Note that this is the number of *retries*
 # so setting it to 0 means each operation will be tried once.
 S3_RETRY_COUNT = from_conf("S3_RETRY_COUNT", 7)
+
+# Number of concurrent S3 processes for parallel operations.
+S3_WORKER_COUNT = from_conf("S3_WORKER_COUNT", 64)
 
 # Number of retries on *transient* failures (such as SlowDown errors). Note
 # that if after S3_TRANSIENT_RETRY_COUNT times, all operations haven't been done,
@@ -91,10 +116,14 @@ RETRY_WARNING_THRESHOLD = 3
 DATATOOLS_SUFFIX = from_conf("DATATOOLS_SUFFIX", "data")
 DATATOOLS_S3ROOT = from_conf(
     "DATATOOLS_S3ROOT",
-    os.path.join(DATASTORE_SYSROOT_S3, DATATOOLS_SUFFIX)
-    if DATASTORE_SYSROOT_S3
-    else None,
+    (
+        os.path.join(DATASTORE_SYSROOT_S3, DATATOOLS_SUFFIX)
+        if DATASTORE_SYSROOT_S3
+        else None
+    ),
 )
+
+TEMPDIR = from_conf("TEMPDIR", ".")
 
 DATATOOLS_CLIENT_PARAMS = from_conf("DATATOOLS_CLIENT_PARAMS", {})
 if S3_ENDPOINT_URL:
@@ -109,29 +138,51 @@ DATATOOLS_SESSION_VARS = from_conf("DATATOOLS_SESSION_VARS", {})
 # Similar to DATATOOLS_LOCALROOT, this is used ONLY by the IncludeFile's internal implementation.
 DATATOOLS_AZUREROOT = from_conf(
     "DATATOOLS_AZUREROOT",
-    os.path.join(DATASTORE_SYSROOT_AZURE, DATATOOLS_SUFFIX)
-    if DATASTORE_SYSROOT_AZURE
-    else None,
+    (
+        os.path.join(DATASTORE_SYSROOT_AZURE, DATATOOLS_SUFFIX)
+        if DATASTORE_SYSROOT_AZURE
+        else None
+    ),
 )
 # GS datatools root location
 # Note: we do not expose an actual datatools library for GS (like we do for S3)
 # Similar to DATATOOLS_LOCALROOT, this is used ONLY by the IncludeFile's internal implementation.
 DATATOOLS_GSROOT = from_conf(
     "DATATOOLS_GSROOT",
-    os.path.join(DATASTORE_SYSROOT_GS, DATATOOLS_SUFFIX)
-    if DATASTORE_SYSROOT_GS
-    else None,
+    (
+        os.path.join(DATASTORE_SYSROOT_GS, DATATOOLS_SUFFIX)
+        if DATASTORE_SYSROOT_GS
+        else None
+    ),
 )
 # Local datatools root location
 DATATOOLS_LOCALROOT = from_conf(
     "DATATOOLS_LOCALROOT",
-    os.path.join(DATASTORE_SYSROOT_LOCAL, DATATOOLS_SUFFIX)
-    if DATASTORE_SYSROOT_LOCAL
-    else None,
+    (
+        os.path.join(DATASTORE_SYSROOT_LOCAL, DATATOOLS_SUFFIX)
+        if DATASTORE_SYSROOT_LOCAL
+        else None
+    ),
 )
 
 # Secrets Backend - AWS Secrets Manager configuration
 AWS_SECRETS_MANAGER_DEFAULT_REGION = from_conf("AWS_SECRETS_MANAGER_DEFAULT_REGION")
+
+# Secrets Backend - GCP Secrets name prefix. With this, users don't have
+# to specify the full secret name in the @secret decorator.
+#
+# Note that it makes a difference whether the prefix ends with a slash or not
+# E.g. if secret name passed to @secret decorator is mysecret:
+# - "projects/1234567890/secrets/" -> "projects/1234567890/secrets/mysecret"
+# - "projects/1234567890/secrets/foo-" -> "projects/1234567890/secrets/foo-mysecret"
+GCP_SECRET_MANAGER_PREFIX = from_conf("GCP_SECRET_MANAGER_PREFIX")
+
+# Secrets Backend - Azure Key Vault prefix. With this, users don't have to
+# specify the full https:// vault url in the @secret decorator.
+#
+# It does not make a difference if the prefix ends in a / or not. We will handle either
+# case correctly.
+AZURE_KEY_VAULT_PREFIX = from_conf("AZURE_KEY_VAULT_PREFIX")
 
 # The root directory to save artifact pulls in, when using S3 or Azure
 ARTIFACT_LOCALROOT = from_conf("ARTIFACT_LOCALROOT", os.getcwd())
@@ -145,9 +196,11 @@ CARD_S3ROOT = from_conf(
 )
 CARD_AZUREROOT = from_conf(
     "CARD_AZUREROOT",
-    os.path.join(DATASTORE_SYSROOT_AZURE, CARD_SUFFIX)
-    if DATASTORE_SYSROOT_AZURE
-    else None,
+    (
+        os.path.join(DATASTORE_SYSROOT_AZURE, CARD_SUFFIX)
+        if DATASTORE_SYSROOT_AZURE
+        else None
+    ),
 )
 CARD_GSROOT = from_conf(
     "CARD_GSROOT",
@@ -156,6 +209,8 @@ CARD_GSROOT = from_conf(
 CARD_NO_WARNING = from_conf("CARD_NO_WARNING", False)
 
 SKIP_CARD_DUALWRITE = from_conf("SKIP_CARD_DUALWRITE", False)
+
+RUNTIME_CARD_RENDER_INTERVAL = from_conf("RUNTIME_CARD_RENDER_INTERVAL", 60)
 
 # Azure storage account URL
 AZURE_STORAGE_BLOB_SERVICE_ENDPOINT = from_conf("AZURE_STORAGE_BLOB_SERVICE_ENDPOINT")
@@ -192,8 +247,45 @@ SERVICE_VERSION_CHECK = from_conf("SERVICE_VERSION_CHECK", True)
 DEFAULT_CONTAINER_IMAGE = from_conf("DEFAULT_CONTAINER_IMAGE")
 # Default container registry
 DEFAULT_CONTAINER_REGISTRY = from_conf("DEFAULT_CONTAINER_REGISTRY")
+# Controls whether to include foreach stack information in metadata.
+# TODO(Darin, 05/01/24): Remove this flag once we are confident with this feature.
+INCLUDE_FOREACH_STACK = from_conf("INCLUDE_FOREACH_STACK", False)
+# Maximum length of the foreach value string to be stored in each ForeachFrame.
+MAXIMUM_FOREACH_VALUE_CHARS = from_conf("MAXIMUM_FOREACH_VALUE_CHARS", 30)
+# The default runtime limit (In seconds) of jobs launched by any compute provider. Default of 5 days.
+DEFAULT_RUNTIME_LIMIT = from_conf("DEFAULT_RUNTIME_LIMIT", 5 * 24 * 60 * 60)
 
+###
+# Organization customizations
+###
 UI_URL = from_conf("UI_URL")
+
+###
+# Capture error logs from argo
+###
+ARGO_WORKFLOWS_CAPTURE_ERROR_SCRIPT = from_conf("ARGO_WORKFLOWS_CAPTURE_ERROR_SCRIPT")
+
+# Contact information displayed when running the `metaflow` command.
+# Value should be a dictionary where:
+#  - key is a string describing contact method
+#  - value is a string describing contact itself (email, web address, etc.)
+# The default value shows an example of this
+CONTACT_INFO = from_conf(
+    "CONTACT_INFO",
+    {
+        "Read the documentation": "http://docs.metaflow.org",
+        "Chat with us": "http://chat.metaflow.org",
+        "Get help by email": "help@metaflow.org",
+    },
+)
+
+
+###
+# Decorators
+###
+# Format is a space separated string of decospecs (what is passed
+# using --with)
+DECOSPECS = from_conf("DECOSPECS", "")
 
 ###
 # AWS Batch configuration
@@ -238,7 +330,15 @@ SFN_STATE_MACHINE_PREFIX = from_conf("SFN_STATE_MACHINE_PREFIX")
 # machine execution logs. This needs to be available when using the
 # `step-functions create --log-execution-history` command.
 SFN_EXECUTION_LOG_GROUP_ARN = from_conf("SFN_EXECUTION_LOG_GROUP_ARN")
-
+# Amazon S3 path for storing the results of AWS Step Functions Distributed Map
+SFN_S3_DISTRIBUTED_MAP_OUTPUT_PATH = from_conf(
+    "SFN_S3_DISTRIBUTED_MAP_OUTPUT_PATH",
+    (
+        os.path.join(DATASTORE_SYSROOT_S3, "sfn_distributed_map_output")
+        if DATASTORE_SYSROOT_S3
+        else None
+    ),
+)
 ###
 # Kubernetes configuration
 ###
@@ -249,20 +349,59 @@ KUBERNETES_SERVICE_ACCOUNT = from_conf("KUBERNETES_SERVICE_ACCOUNT")
 # Default node selectors to use by K8S jobs created by Metaflow - foo=bar,baz=bab
 KUBERNETES_NODE_SELECTOR = from_conf("KUBERNETES_NODE_SELECTOR", "")
 KUBERNETES_TOLERATIONS = from_conf("KUBERNETES_TOLERATIONS", "")
+KUBERNETES_PERSISTENT_VOLUME_CLAIMS = from_conf(
+    "KUBERNETES_PERSISTENT_VOLUME_CLAIMS", ""
+)
 KUBERNETES_SECRETS = from_conf("KUBERNETES_SECRETS", "")
+# Default labels for kubernetes pods
+KUBERNETES_LABELS = from_conf("KUBERNETES_LABELS", "")
+# Default annotations for kubernetes pods
+KUBERNETES_ANNOTATIONS = from_conf("KUBERNETES_ANNOTATIONS", "")
 # Default GPU vendor to use by K8S jobs created by Metaflow (supports nvidia, amd)
 KUBERNETES_GPU_VENDOR = from_conf("KUBERNETES_GPU_VENDOR", "nvidia")
 # Default container image for K8S
 KUBERNETES_CONTAINER_IMAGE = from_conf(
     "KUBERNETES_CONTAINER_IMAGE", DEFAULT_CONTAINER_IMAGE
 )
+# Image pull policy for container images
+KUBERNETES_IMAGE_PULL_POLICY = from_conf("KUBERNETES_IMAGE_PULL_POLICY", None)
 # Default container registry for K8S
 KUBERNETES_CONTAINER_REGISTRY = from_conf(
     "KUBERNETES_CONTAINER_REGISTRY", DEFAULT_CONTAINER_REGISTRY
 )
+# Toggle for trying to fetch EC2 instance metadata
+KUBERNETES_FETCH_EC2_METADATA = from_conf("KUBERNETES_FETCH_EC2_METADATA", False)
+# Shared memory in MB to use for this step
+KUBERNETES_SHARED_MEMORY = from_conf("KUBERNETES_SHARED_MEMORY", None)
+# Default port number to open on the pods
+KUBERNETES_PORT = from_conf("KUBERNETES_PORT", None)
+# Default kubernetes resource requests for CPU, memory and disk
+KUBERNETES_CPU = from_conf("KUBERNETES_CPU", None)
+KUBERNETES_MEMORY = from_conf("KUBERNETES_MEMORY", None)
+KUBERNETES_DISK = from_conf("KUBERNETES_DISK", None)
+# Default kubernetes QoS class
+KUBERNETES_QOS = from_conf("KUBERNETES_QOS", "burstable")
 
 ARGO_WORKFLOWS_KUBERNETES_SECRETS = from_conf("ARGO_WORKFLOWS_KUBERNETES_SECRETS", "")
 ARGO_WORKFLOWS_ENV_VARS_TO_SKIP = from_conf("ARGO_WORKFLOWS_ENV_VARS_TO_SKIP", "")
+
+KUBERNETES_JOBSET_GROUP = from_conf("KUBERNETES_JOBSET_GROUP", "jobset.x-k8s.io")
+KUBERNETES_JOBSET_VERSION = from_conf("KUBERNETES_JOBSET_VERSION", "v1alpha2")
+
+##
+# Argo Events Configuration
+##
+ARGO_EVENTS_SERVICE_ACCOUNT = from_conf("ARGO_EVENTS_SERVICE_ACCOUNT")
+ARGO_EVENTS_EVENT_BUS = from_conf("ARGO_EVENTS_EVENT_BUS", "default")
+ARGO_EVENTS_EVENT_SOURCE = from_conf("ARGO_EVENTS_EVENT_SOURCE")
+ARGO_EVENTS_EVENT = from_conf("ARGO_EVENTS_EVENT")
+ARGO_EVENTS_WEBHOOK_URL = from_conf("ARGO_EVENTS_WEBHOOK_URL")
+ARGO_EVENTS_INTERNAL_WEBHOOK_URL = from_conf(
+    "ARGO_EVENTS_INTERNAL_WEBHOOK_URL", ARGO_EVENTS_WEBHOOK_URL
+)
+ARGO_EVENTS_WEBHOOK_AUTH = from_conf("ARGO_EVENTS_WEBHOOK_AUTH", "none")
+
+ARGO_WORKFLOWS_UI_URL = from_conf("ARGO_WORKFLOWS_UI_URL")
 
 ##
 # Airflow Configuration
@@ -294,13 +433,22 @@ CONDA_PACKAGE_GSROOT = from_conf("CONDA_PACKAGE_GSROOT")
 # should result in an appreciable speedup in flow environment initialization.
 CONDA_DEPENDENCY_RESOLVER = from_conf("CONDA_DEPENDENCY_RESOLVER", "conda")
 
+# Default to not using fast init binary.
+CONDA_USE_FAST_INIT = from_conf("CONDA_USE_FAST_INIT", False)
+
+###
+# Escape hatch configuration
+###
+# Print out warning if escape hatch is not used for the target packages
+ESCAPE_HATCH_WARNING = from_conf("ESCAPE_HATCH_WARNING", True)
+
 ###
 # Debug configuration
 ###
-DEBUG_OPTIONS = ["subcommand", "sidecar", "s3client"]
+DEBUG_OPTIONS = ["subcommand", "sidecar", "s3client", "tracing", "stubgen", "userconf"]
 
 for typ in DEBUG_OPTIONS:
-    vars()["DEBUG_%s" % typ.upper()] = from_conf("DEBUG_%s" % typ.upper())
+    vars()["DEBUG_%s" % typ.upper()] = from_conf("DEBUG_%s" % typ.upper(), False)
 
 ###
 # Plugin configuration
@@ -347,6 +495,12 @@ if AWS_SANDBOX_ENABLED:
 
 KUBERNETES_SANDBOX_INIT_SCRIPT = from_conf("KUBERNETES_SANDBOX_INIT_SCRIPT")
 
+OTEL_ENDPOINT = from_conf("OTEL_ENDPOINT")
+ZIPKIN_ENDPOINT = from_conf("ZIPKIN_ENDPOINT")
+CONSOLE_TRACE_ENABLED = from_conf("CONSOLE_TRACE_ENABLED", False)
+# internal env used for preventing the tracing module from loading during Conda bootstrapping.
+DISABLE_TRACING = bool(os.environ.get("DISABLE_TRACING", False))
+
 # MAX_ATTEMPTS is the maximum number of attempts, including the first
 # task, retries, and the final fallback task and its retries.
 #
@@ -359,23 +513,10 @@ KUBERNETES_SANDBOX_INIT_SCRIPT = from_conf("KUBERNETES_SANDBOX_INIT_SCRIPT")
 # lexicographic ordering of attempts. This won't work if MAX_ATTEMPTS > 99.
 MAX_ATTEMPTS = 6
 
+# Feature flag (experimental features that are *explicitly* unsupported)
 
-# the naughty, naughty driver.py imported by lib2to3 produces
-# spam messages to the root logger. This is what is required
-# to silence it:
-class Filter(logging.Filter):
-    def filter(self, record):
-        if record.pathname.endswith("driver.py") and "grammar" in record.msg:
-            return False
-        return True
-
-
-logger = logging.getLogger()
-logger.addFilter(Filter())
-
-
-def get_version(pkg):
-    return pkg_resources.get_distribution(pkg).version
+# Process configs even when using the click_api for Runner/Deployer
+CLICK_API_PROCESS_CONFIG = from_conf("CLICK_API_PROCESS_CONFIG", False)
 
 
 # PINNED_CONDA_LIBS are the libraries that metaflow depends on for execution
@@ -389,9 +530,11 @@ def get_pinned_conda_libs(python_version, datastore_type):
     elif datastore_type == "azure":
         pins["azure-identity"] = ">=1.10.0"
         pins["azure-storage-blob"] = ">=12.12.0"
+        pins["azure-keyvault-secrets"] = ">=4.7.0"
     elif datastore_type == "gs":
         pins["google-cloud-storage"] = ">=2.5.0"
         pins["google-auth"] = ">=2.11.0"
+        pins["google-cloud-secret-manager"] = ">=2.10.0"
     elif datastore_type == "local":
         pass
     else:
@@ -405,6 +548,8 @@ def get_pinned_conda_libs(python_version, datastore_type):
 try:
     from metaflow.extension_support import get_modules
 
+    _TOGGLE_DECOSPECS = []
+
     ext_modules = get_modules("config")
     for m in ext_modules:
         # We load into globals whatever we have in extension_module
@@ -414,7 +559,7 @@ try:
                 DEBUG_OPTIONS.extend(o)
                 for typ in o:
                     vars()["DEBUG_%s" % typ.upper()] = from_conf(
-                        "DEBUG_%s" % typ.upper()
+                        "DEBUG_%s" % typ.upper(), False
                     )
             elif n == "get_pinned_conda_libs":
 
@@ -428,8 +573,18 @@ try:
                     return d1
 
                 globals()[n] = _new_get_pinned_conda_libs
+            elif n == "TOGGLE_DECOSPECS":
+                if any([x.startswith("-") for x in o]):
+                    raise ValueError("Removing decospecs is not currently supported")
+                if any(" " in x for x in o):
+                    raise ValueError("Decospecs cannot contain spaces")
+                _TOGGLE_DECOSPECS.extend(o)
             elif not n.startswith("__") and not isinstance(o, types.ModuleType):
                 globals()[n] = o
+    # If DECOSPECS is set, use that, else extrapolate from extensions
+    if not DECOSPECS:
+        DECOSPECS = " ".join(_TOGGLE_DECOSPECS)
+
 finally:
     # Erase all temporary names to avoid leaking things
     for _n in [
@@ -446,6 +601,7 @@ finally:
         "v",
         "f1",
         "f2",
+        "_TOGGLE_DECOSPECS",
     ]:
         try:
             del globals()[_n]

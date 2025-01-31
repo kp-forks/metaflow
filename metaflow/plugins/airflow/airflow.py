@@ -1,60 +1,64 @@
-from io import BytesIO
 import json
 import os
 import random
 import string
 import sys
 from datetime import datetime, timedelta
-from metaflow.includefile import FilePathClass
+from io import BytesIO
 
 import metaflow.util as util
+from metaflow import current
 from metaflow.decorators import flow_decorators
 from metaflow.exception import MetaflowException
+from metaflow.includefile import FilePathClass
 from metaflow.metaflow_config import (
-    SERVICE_HEADERS,
-    SERVICE_INTERNAL_URL,
-    CARD_S3ROOT,
-    DATASTORE_SYSROOT_S3,
-    DATATOOLS_S3ROOT,
-    KUBERNETES_SERVICE_ACCOUNT,
-    KUBERNETES_SECRETS,
-    AIRFLOW_KUBERNETES_STARTUP_TIMEOUT_SECONDS,
-    AZURE_STORAGE_BLOB_SERVICE_ENDPOINT,
-    DATASTORE_SYSROOT_AZURE,
-    CARD_AZUREROOT,
     AIRFLOW_KUBERNETES_CONN_ID,
     AIRFLOW_KUBERNETES_KUBECONFIG_CONTEXT,
     AIRFLOW_KUBERNETES_KUBECONFIG_FILE,
-    DATASTORE_SYSROOT_GS,
-    CARD_GSROOT,
-    DEFAULT_SECRETS_BACKEND_TYPE,
+    AIRFLOW_KUBERNETES_STARTUP_TIMEOUT_SECONDS,
     AWS_SECRETS_MANAGER_DEFAULT_REGION,
+    GCP_SECRET_MANAGER_PREFIX,
+    AZURE_STORAGE_BLOB_SERVICE_ENDPOINT,
+    CARD_AZUREROOT,
+    CARD_GSROOT,
+    CARD_S3ROOT,
+    DATASTORE_SYSROOT_AZURE,
+    DATASTORE_SYSROOT_GS,
+    DATASTORE_SYSROOT_S3,
+    DATATOOLS_S3ROOT,
+    DEFAULT_SECRETS_BACKEND_TYPE,
+    KUBERNETES_SECRETS,
+    KUBERNETES_SERVICE_ACCOUNT,
+    S3_ENDPOINT_URL,
+    SERVICE_HEADERS,
+    SERVICE_INTERNAL_URL,
+    AZURE_KEY_VAULT_PREFIX,
 )
-from metaflow.parameters import DelayedEvaluationParameter, deploy_time_eval
-from metaflow.plugins.kubernetes.kubernetes import Kubernetes
+
+from metaflow.metaflow_config_funcs import config_values
+
+from metaflow.parameters import (
+    DelayedEvaluationParameter,
+    JSONTypeClass,
+    deploy_time_eval,
+)
 
 # TODO: Move chevron to _vendor
 from metaflow.plugins.cards.card_modules import chevron
+from metaflow.plugins.kubernetes.kubernetes import Kubernetes
+from metaflow.plugins.kubernetes.kube_utils import qos_requests_and_limits
 from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
-from metaflow.util import dict_to_cli_options, get_username, compress_list
-from metaflow.parameters import JSONTypeClass
+from metaflow.util import compress_list, dict_to_cli_options, get_username
 
 from . import airflow_utils
+from .airflow_utils import AIRFLOW_MACROS, TASK_ID_XCOM_KEY, AirflowTask, Workflow
 from .exception import AirflowException
 from .sensors import SUPPORTED_SENSORS
-from .airflow_utils import (
-    TASK_ID_XCOM_KEY,
-    AirflowTask,
-    Workflow,
-    AIRFLOW_MACROS,
-)
-from metaflow import current
 
 AIRFLOW_DEPLOY_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "dag.py")
 
 
 class Airflow(object):
-
     TOKEN_STORAGE_ROOT = "mf.airflow"
 
     def __init__(
@@ -279,7 +283,7 @@ class Airflow(object):
         env_deco = [deco for deco in node.decorators if deco.name == "environment"]
         env = {}
         if env_deco:
-            env = env_deco[0].attributes["vars"]
+            env = env_deco[0].attributes["vars"].copy()
 
         # The below if/else block handles "input paths".
         # Input Paths help manage dataflow across the graph.
@@ -337,6 +341,16 @@ class Airflow(object):
         metaflow_version["production_token"] = self.production_token
         env["METAFLOW_VERSION"] = json.dumps(metaflow_version)
 
+        # Temporary passing of *some* environment variables. Do not rely on this
+        # mechanism as it will be removed in the near future
+        env.update(
+            {
+                k: v
+                for k, v in config_values()
+                if k.startswith("METAFLOW_CONDA_") or k.startswith("METAFLOW_DEBUG_")
+            }
+        )
+
         # Extract the k8s decorators for constructing the arguments of the K8s Pod Operator on Airflow.
         k8s_deco = [deco for deco in node.decorators if deco.name == "kubernetes"][0]
         user_code_retries, _ = self._get_retries(node)
@@ -384,18 +398,24 @@ class Airflow(object):
             # GCP stuff
             "METAFLOW_DATASTORE_SYSROOT_GS": DATASTORE_SYSROOT_GS,
             "METAFLOW_CARD_GSROOT": CARD_GSROOT,
+            "METAFLOW_S3_ENDPOINT_URL": S3_ENDPOINT_URL,
         }
-        env[
-            "METAFLOW_AZURE_STORAGE_BLOB_SERVICE_ENDPOINT"
-        ] = AZURE_STORAGE_BLOB_SERVICE_ENDPOINT
+        env["METAFLOW_AZURE_STORAGE_BLOB_SERVICE_ENDPOINT"] = (
+            AZURE_STORAGE_BLOB_SERVICE_ENDPOINT
+        )
         env["METAFLOW_DATASTORE_SYSROOT_AZURE"] = DATASTORE_SYSROOT_AZURE
         env["METAFLOW_CARD_AZUREROOT"] = CARD_AZUREROOT
         if DEFAULT_SECRETS_BACKEND_TYPE:
             env["METAFLOW_DEFAULT_SECRETS_BACKEND_TYPE"] = DEFAULT_SECRETS_BACKEND_TYPE
         if AWS_SECRETS_MANAGER_DEFAULT_REGION:
-            env[
-                "METAFLOW_AWS_SECRETS_MANAGER_DEFAULT_REGION"
-            ] = AWS_SECRETS_MANAGER_DEFAULT_REGION
+            env["METAFLOW_AWS_SECRETS_MANAGER_DEFAULT_REGION"] = (
+                AWS_SECRETS_MANAGER_DEFAULT_REGION
+            )
+        if GCP_SECRET_MANAGER_PREFIX:
+            env["METAFLOW_GCP_SECRET_MANAGER_PREFIX"] = GCP_SECRET_MANAGER_PREFIX
+
+        if AZURE_KEY_VAULT_PREFIX:
+            env["METAFLOW_AZURE_KEY_VAULT_PREFIX"] = AZURE_KEY_VAULT_PREFIX
 
         env.update(additional_mf_variables)
 
@@ -409,25 +429,25 @@ class Airflow(object):
             if k8s_deco.attributes["namespace"] is not None
             else "default"
         )
-
-        resources = dict(
-            requests={
-                "cpu": k8s_deco.attributes["cpu"],
-                "memory": "%sM" % str(k8s_deco.attributes["memory"]),
-                "ephemeral-storage": str(k8s_deco.attributes["disk"]),
-            }
+        qos_requests, qos_limits = qos_requests_and_limits(
+            k8s_deco.attributes["qos"],
+            k8s_deco.attributes["cpu"],
+            k8s_deco.attributes["memory"],
+            k8s_deco.attributes["disk"],
         )
-        if k8s_deco.attributes["gpu"] is not None:
-            resources.update(
-                dict(
-                    limits={
-                        "%s.com/gpu".lower()
-                        % k8s_deco.attributes["gpu_vendor"]: str(
-                            k8s_deco.attributes["gpu"]
-                        )
-                    }
-                )
-            )
+        resources = dict(
+            requests=qos_requests,
+            limits={
+                **qos_limits,
+                **{
+                    "%s.com/gpu".lower()
+                    % k8s_deco.attributes["gpu_vendor"]: str(k8s_deco.attributes["gpu"])
+                    for k in [0]
+                    # Don't set GPU limits if gpu isn't specified.
+                    if k8s_deco.attributes["gpu"] is not None
+                },
+            },
+        )
 
         annotations = {
             "metaflow/production_token": self.production_token,
@@ -520,7 +540,7 @@ class Airflow(object):
         # FlowDecorators can define their own top-level options. They are
         # responsible for adding their own top-level options and values through
         # the get_top_level_options() hook. See similar logic in runtime.py.
-        for deco in flow_decorators():
+        for deco in flow_decorators(self.flow):
             top_opts_dict.update(deco.get_top_level_options())
 
         top_opts = list(dict_to_cli_options(top_opts_dict))
@@ -626,8 +646,36 @@ class Airflow(object):
         return False
 
     def compile(self):
+        if self.flow._flow_decorators.get("trigger") or self.flow._flow_decorators.get(
+            "trigger_on_finish"
+        ):
+            raise AirflowException(
+                "Deploying flows with @trigger or @trigger_on_finish decorator(s) "
+                "to Airflow is not supported currently."
+            )
+
         # Visit every node of the flow and recursively build the state machine.
         def _visit(node, workflow, exit_node=None):
+            kube_deco = dict(
+                [deco for deco in node.decorators if deco.name == "kubernetes"][
+                    0
+                ].attributes
+            )
+            if kube_deco:
+                # Only guard against use_tmpfs and tmpfs_size as these determine if tmpfs is enabled.
+                for attr in [
+                    "use_tmpfs",
+                    "tmpfs_size",
+                    "persistent_volume_claims",
+                    "image_pull_policy",
+                ]:
+                    if kube_deco[attr]:
+                        raise AirflowException(
+                            "The decorator attribute *%s* is currently not supported on Airflow "
+                            "for the @kubernetes decorator on step *%s*"
+                            % (attr, node.name)
+                        )
+
             parent_is_foreach = any(  # Any immediate parent is a foreach node.
                 self.graph[n].type == "foreach" for n in node.in_funcs
             )

@@ -1,36 +1,45 @@
 from __future__ import print_function
-from datetime import datetime
+
+import json
 import os
 import tarfile
-import json
-from io import BytesIO
 from collections import namedtuple
+from datetime import datetime
+from io import BytesIO
 from itertools import chain
 from typing import (
     Any,
     Dict,
     FrozenSet,
     Iterable,
+    Iterator,
     List,
+    NamedTuple,
     Optional,
+    TYPE_CHECKING,
     Tuple,
 )
 
-from metaflow.metaflow_environment import MetaflowEnvironment
-from metaflow.current import current
+from metaflow.metaflow_current import current
+from metaflow.events import Trigger
 from metaflow.exception import (
-    MetaflowNotFound,
-    MetaflowNamespaceMismatch,
     MetaflowInternalError,
+    MetaflowInvalidPathspec,
+    MetaflowNamespaceMismatch,
+    MetaflowNotFound,
 )
 from metaflow.includefile import IncludedFile
 from metaflow.metaflow_config import DEFAULT_METADATA, MAX_ATTEMPTS
+from metaflow.metaflow_environment import MetaflowEnvironment
 from metaflow.plugins import ENVIRONMENTS, METADATA_PROVIDERS
 from metaflow.unbounded_foreach import CONTROL_TASK_TAG
-from metaflow.util import cached_property, resolve_identity, to_unicode, is_stringish
+from metaflow.util import cached_property, is_stringish, resolve_identity, to_unicode
 
+from ..info_file import INFO_FILE
 from .filecache import FileCache
-from .. import INFO_FILE
+
+if TYPE_CHECKING:
+    from metaflow.metadata_provider import MetadataProvider
 
 try:
     # python2
@@ -77,28 +86,16 @@ def metadata(ms: str) -> str:
         get_metadata()).
     """
     global current_metadata
-    infos = ms.split("@", 1)
-    types = [m.TYPE for m in METADATA_PROVIDERS]
-    if infos[0] in types:
-        current_metadata = [m for m in METADATA_PROVIDERS if m.TYPE == infos[0]][0]
-        if len(infos) > 1:
-            current_metadata.INFO = infos[1]
-    else:
-        # Deduce from ms; if starts with http, use service or else use local
-        if ms.startswith("http"):
-            metadata_type = "service"
-        else:
-            metadata_type = "local"
-        res = [m for m in METADATA_PROVIDERS if m.TYPE == metadata_type]
-        if not res:
-            print(
-                "Cannot find a '%s' metadata provider -- "
-                "try specifying one explicitly using <type>@<info>",
-                metadata_type,
-            )
-            return get_metadata()
-        current_metadata = res[0]
-        current_metadata.INFO = ms
+    provider, info = _metadata(ms)
+    if provider is None:
+        print(
+            "Cannot find a metadata provider -- "
+            "try specifying one explicitly using <type>@<info>",
+        )
+        return get_metadata()
+    current_metadata = provider
+    if info:
+        current_metadata.INFO = info
     return get_metadata()
 
 
@@ -122,7 +119,7 @@ def get_metadata() -> str:
     """
     if current_metadata is False:
         default_metadata()
-    return "%s@%s" % (current_metadata.TYPE, current_metadata.INFO)
+    return current_metadata.metadata_str()
 
 
 def default_metadata() -> str:
@@ -146,7 +143,7 @@ def default_metadata() -> str:
     if default:
         current_metadata = default[0]
     else:
-        from metaflow.plugins.metadata import LocalMetadataProvider
+        from metaflow.plugins.metadata_providers import LocalMetadataProvider
 
         current_metadata = LocalMetadataProvider
     return get_metadata()
@@ -208,6 +205,9 @@ def default_namespace() -> str:
     return get_namespace()
 
 
+MetaflowArtifacts = NamedTuple
+
+
 class MetaflowObject(object):
     """
     Base class for all Metaflow objects.
@@ -260,11 +260,26 @@ class MetaflowObject(object):
         _object: Optional["MetaflowObject"] = None,
         _parent: Optional["MetaflowObject"] = None,
         _namespace_check: bool = True,
+        _metaflow: Optional["Metaflow"] = None,
+        _current_namespace: Optional[str] = None,
+        _current_metadata: Optional[str] = None,
     ):
-        self._metaflow = Metaflow()
+        # the default namespace is activated lazily at the first
+        # get_namespace(). The other option of activating
+        # the namespace at the import time is problematic, since there
+        # may be other modules that alter environment variables etc.
+        # which may affect the namespace setting.
+        self._metaflow = Metaflow(_current_metadata) or _metaflow
         self._parent = _parent
         self._path_components = None
         self._attempt = attempt
+        self._current_namespace = _current_namespace or get_namespace()
+        self._namespace_check = _namespace_check
+        # If the current namespace is False, we disable checking for namespace for this
+        # and all children objects. Not setting namespace_check to False has the consequence
+        # of preventing access to children objects after the namespace changes
+        if self._current_namespace is None:
+            self._namespace_check = False
 
         if self._attempt is not None:
             if self._NAME not in ["task", "artifact"]:
@@ -289,6 +304,21 @@ class MetaflowObject(object):
         if pathspec:
             ids = pathspec.split("/")
 
+            if self._NAME == "flow" and len(ids) != 1:
+                raise MetaflowInvalidPathspec("Expects Flow('FlowName')")
+            elif self._NAME == "run" and len(ids) != 2:
+                raise MetaflowInvalidPathspec("Expects Run('FlowName/RunID')")
+            elif self._NAME == "step" and len(ids) != 3:
+                raise MetaflowInvalidPathspec("Expects Step('FlowName/RunID/StepName')")
+            elif self._NAME == "task" and len(ids) != 4:
+                raise MetaflowInvalidPathspec(
+                    "Expects Task('FlowName/RunID/StepName/TaskID')"
+                )
+            elif self._NAME == "artifact" and len(ids) != 5:
+                raise MetaflowInvalidPathspec(
+                    "Expects DataArtifact('FlowName/RunID/StepName/TaskID/ArtifactName')"
+                )
+
             self.id = ids[-1]
             self._pathspec = pathspec
             self._object = self._get_object(*ids)
@@ -296,16 +326,16 @@ class MetaflowObject(object):
             self._object = _object
             self._pathspec = pathspec
 
-        if self._NAME in ("flow", "task"):
-            self.id = str(self._object[self._NAME + "_id"])
-        elif self._NAME == "run":
-            self.id = str(self._object["run_number"])
-        elif self._NAME == "step":
-            self.id = str(self._object["step_name"])
-        elif self._NAME == "artifact":
-            self.id = str(self._object["name"])
-        else:
-            raise MetaflowInternalError(msg="Unknown type: %s" % self._NAME)
+            if self._NAME in ("flow", "task"):
+                self.id = str(self._object[self._NAME + "_id"])
+            elif self._NAME == "run":
+                self.id = str(self._object["run_number"])
+            elif self._NAME == "step":
+                self.id = str(self._object["step_name"])
+            elif self._NAME == "artifact":
+                self.id = str(self._object["name"])
+            else:
+                raise MetaflowInternalError(msg="Unknown type: %s" % self._NAME)
 
         self._created_at = datetime.fromtimestamp(self._object["ts_epoch"] / 1000.0)
 
@@ -315,8 +345,8 @@ class MetaflowObject(object):
         self._user_tags = frozenset(self._object.get("tags") or [])
         self._system_tags = frozenset(self._object.get("system_tags") or [])
 
-        if _namespace_check and not self.is_in_namespace():
-            raise MetaflowNamespaceMismatch(current_namespace)
+        if self._namespace_check and not self._is_in_namespace(self._current_namespace):
+            raise MetaflowNamespaceMismatch(self._current_namespace)
 
     def _get_object(self, *path_components):
         result = self._metaflow.metadata.get_object(
@@ -326,20 +356,23 @@ class MetaflowObject(object):
             raise MetaflowNotFound("%s does not exist" % self)
         return result
 
-    def __iter__(self) -> Iterable["MetaflowObject"]:
+    def __iter__(self) -> Iterator["MetaflowObject"]:
         """
         Iterate over all child objects of this object if any.
 
-        Note that only children present in the current namespace are returned.
+        Note that only children present in the current namespace are returned if and
+        only if _namespace_check is set.
 
-        Returns
-        -------
-        Iterable[MetaflowObject]
-            Iterator over all children
+        Yields
+        ------
+        MetaflowObject
+            Children of this object
         """
         query_filter = {}
-        if current_namespace:
-            query_filter = {"any_tags": current_namespace}
+
+        # skip namespace filtering if _namespace_check is unset.
+        if self._namespace_check and self._current_namespace:
+            query_filter = {"any_tags": self._current_namespace}
 
         unfiltered_children = self._metaflow.metadata.get_object(
             self._NAME,
@@ -356,7 +389,11 @@ class MetaflowObject(object):
                     attempt=self._attempt,
                     _object=obj,
                     _parent=self,
-                    _namespace_check=False,
+                    _metaflow=self._metaflow,
+                    _namespace_check=self._namespace_check,
+                    _current_namespace=(
+                        self._current_namespace if self._namespace_check else None
+                    ),
                 )
                 for obj in unfiltered_children
             ),
@@ -381,6 +418,10 @@ class MetaflowObject(object):
             if all(tag in child.tags for tag in tags):
                 yield child
 
+    def _ipython_key_completions_(self):
+        """Returns available options for ipython auto-complete."""
+        return [child.id for child in self._filtered_children()]
+
     @classmethod
     def _url_token(cls):
         return "%ss" % cls._NAME
@@ -396,10 +437,27 @@ class MetaflowObject(object):
         bool
             Whether or not the object is in the current namespace
         """
+        return self._is_in_namespace(current_namespace)
+
+    def _is_in_namespace(self, ns: str) -> bool:
+        """
+        Returns whether this object is in namespace passed in.
+
+        If the current namespace is None, this will always return True.
+
+        Parameters
+        ----------
+        ns : str
+            Namespace to check if the object is in.
+        Returns
+        -------
+        bool
+            Whether or not the object is in the current namespace
+        """
         if self._NAME == "flow":
             return any(True for _ in self)
         else:
-            return current_namespace is None or current_namespace in self._tags
+            return ns is None or ns in self._tags
 
     def __str__(self):
         if self._attempt is not None:
@@ -444,7 +502,14 @@ class MetaflowObject(object):
         obj = self._get_child(id)
         if obj:
             return _CLASSES[self._CHILD_CLASS](
-                attempt=self._attempt, _object=obj, _parent=self
+                attempt=self._attempt,
+                _object=obj,
+                _parent=self,
+                _metaflow=self._metaflow,
+                _namespace_check=self._namespace_check,
+                _current_namespace=(
+                    self._current_namespace if self._namespace_check else None
+                ),
             )
         else:
             raise KeyError(id)
@@ -464,6 +529,100 @@ class MetaflowObject(object):
             True if the child exists or False otherwise
         """
         return bool(self._get_child(id))
+
+    def _unpickle_284(self, data):
+        if len(data) != 3:
+            raise MetaflowInternalError(
+                "Unexpected size of array: {}".format(len(data))
+            )
+        pathspec, attempt, namespace_check = data
+        self.__init__(
+            pathspec=pathspec, attempt=attempt, _namespace_check=namespace_check
+        )
+
+    def _unpickle_2124(self, data):
+        if len(data) != 4:
+            raise MetaflowInternalError(
+                "Unexpected size of array: {}".format(len(data))
+            )
+        pathspec, attempt, ns, namespace_check = data
+        self.__init__(
+            pathspec=pathspec,
+            attempt=attempt,
+            _namespace_check=namespace_check,
+            _current_namespace=ns,
+        )
+
+    def _unpickle_21227(self, data):
+        if len(data) != 5:
+            raise MetaflowInternalError(
+                "Unexpected size of array: {}".format(len(data))
+            )
+        pathspec, attempt, md, ns, namespace_check = data
+        self.__init__(
+            pathspec=pathspec,
+            attempt=attempt,
+            _namespace_check=namespace_check,
+            _current_metadata=md,
+            _current_namespace=ns,
+        )
+
+    _UNPICKLE_FUNC = {
+        "2.8.4": _unpickle_284,
+        "2.12.4": _unpickle_2124,
+        "2.12.27": _unpickle_21227,
+    }
+
+    def __setstate__(self, state):
+        """
+        This function is used during the unpickling operation.
+        More info here https://docs.python.org/3/library/pickle.html#object.__setstate__
+        """
+        if "version" in state and "data" in state:
+            version = state["version"]
+            if version not in self._UNPICKLE_FUNC:
+                # this happens when an object pickled using a newer version of Metaflow is
+                # being un-pickled using an older version of Metaflow
+                raise MetaflowInternalError(
+                    "Unpickling this object requires a Metaflow version greater than or equal to {}".format(
+                        version
+                    )
+                )
+            self._UNPICKLE_FUNC[version](self, state["data"])
+        else:
+            # For backward compatibility: handles pickled objects that were serialized without a __getstate__ override
+            # We set namespace_check to False if it doesn't exist so that the user can
+            # continue accessing this object once unpickled.
+            self.__init__(
+                pathspec=state.get("_pathspec", None),
+                attempt=state.get("_attempt", None),
+                _namespace_check=state.get("_namespace_check", False),
+                _current_namespace=None,
+            )
+
+    def __getstate__(self):
+        """
+        This function is used during the pickling operation.
+        More info here https://docs.python.org/3/library/pickle.html#object.__getstate__
+
+        This function is not forward compatible i.e., if this object (or any of the objects deriving
+        from this object) are pickled (serialized) in a later version of Metaflow, it may not be possible
+        to unpickle (deserialize) them in a previous version of Metaflow.
+        """
+        # Note that we now record the namespace at the time of the object creation so
+        # we don't need to force namespace_check to be False and can properly continue
+        # checking for the namespace even after unpickling since we will know which
+        # namespace to check.
+        return {
+            "version": "2.12.27",
+            "data": [
+                self.pathspec,
+                self._attempt,
+                self._metaflow.metadata.metadata_str(),
+                self._current_namespace,
+                self._namespace_check,
+            ],
+        }
 
     @property
     def tags(self) -> FrozenSet[str]:
@@ -531,7 +690,7 @@ class MetaflowObject(object):
         origin_pathspec = None
         if self._NAME == "run":
             latest_step = next(self.steps())
-            if latest_step:
+            if latest_step and latest_step.task:
                 # If we had a step
                 task = latest_step.task
                 origin_run_id = [
@@ -622,54 +781,10 @@ class MetaflowObject(object):
         return list(self._path_components)
 
 
-class MetaflowData(object):
-    """
-    Container of data artifacts produced by a `Task`. This object is
-    instantiated through `Task.data`.
-
-    `MetaflowData` allows results to be retrieved by their name
-    through a convenient dot notation:
-
-    ```python
-    Task(...).data.my_object
-    ```
-
-    You can also test the existence of an object
-
-    ```python
-    if 'my_object' in Task(...).data:
-        print('my_object found')
-    ```
-
-    Note that this container relies on the local cache to load all data
-    artifacts. If your `Task` contains a lot of data, a more efficient
-    approach is to load artifacts individually like so
-
-    ```
-    Task(...)['my_object'].data
-    ```
-    """
-
-    def __init__(self, artifacts: Iterable["DataArtifact"]):
-        self._artifacts = dict((art.id, art) for art in artifacts)
-
-    def __getattr__(self, name: str):
-        return self._artifacts[name].data
-
-    def __contains__(self, var):
-        return var in self._artifacts
-
-    def __str__(self):
-        return "<MetaflowData: %s>" % ", ".join(self._artifacts)
-
-    def __repr__(self):
-        return str(self)
-
-
 class MetaflowCode(object):
     """
     Snapshot of the code used to execute this `Run`. Instantiate the object through
-    `Run(...).code` (if all steps are executed remotely) or `Task(...).code` for an
+    `Run(...).code` (if any step is executed remotely) or `Task(...).code` for an
     individual task. The code package is the same for all steps of a `Run`.
 
     `MetaflowCode` includes a package of the user-defined `FlowSpec` class and supporting
@@ -893,6 +1008,58 @@ class DataArtifact(MetaflowObject):
         """
         return self.created_at
 
+    def __getstate__(self):
+        return super(DataArtifact, self).__getstate__()
+
+    def __setstate__(self, state):
+        super(DataArtifact, self).__setstate__(state)
+
+
+class MetaflowData(object):
+    """
+    Container of data artifacts produced by a `Task`. This object is
+    instantiated through `Task.data`.
+
+    `MetaflowData` allows results to be retrieved by their name
+    through a convenient dot notation:
+
+    ```python
+    Task(...).data.my_object
+    ```
+
+    You can also test the existence of an object
+
+    ```python
+    if 'my_object' in Task(...).data:
+        print('my_object found')
+    ```
+
+    Note that this container relies on the local cache to load all data
+    artifacts. If your `Task` contains a lot of data, a more efficient
+    approach is to load artifacts individually like so
+
+    ```
+    Task(...)['my_object'].data
+    ```
+    """
+
+    def __init__(self, artifacts: Iterable[DataArtifact]):
+        self._artifacts = dict((art.id, art) for art in artifacts)
+
+    def __getattr__(self, name: str):
+        if name not in self._artifacts:
+            raise AttributeError(name)
+        return self._artifacts[name].data
+
+    def __contains__(self, var):
+        return var in self._artifacts
+
+    def __str__(self):
+        return "<MetaflowData: %s>" % ", ".join(self._artifacts)
+
+    def __repr__(self):
+        return str(self)
+
 
 class Task(MetaflowObject):
     """
@@ -1085,7 +1252,7 @@ class Task(MetaflowObject):
         return MetaflowData(self)
 
     @property
-    def artifacts(self) -> "MetaflowArtifacts":
+    def artifacts(self) -> MetaflowArtifacts:
         """
         Returns a container of DataArtifacts produced by this task.
 
@@ -1351,8 +1518,11 @@ class Task(MetaflowObject):
             return self._log_size(stream, meta_dict)
 
     def loglines(
-        self, stream: str, as_unicode: bool = True, meta_dict: Dict[str, Any] = None
-    ) -> Iterable[Tuple[datetime, str]]:
+        self,
+        stream: str,
+        as_unicode: bool = True,
+        meta_dict: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Tuple[datetime, str]]:
         """
         Return an iterator over (utc_timestamp, logline) tuples.
 
@@ -1364,10 +1534,10 @@ class Task(MetaflowObject):
             If as_unicode=False, each logline is returned as a byte object. Otherwise,
             it is returned as a (unicode) string.
 
-        Returns
-        -------
-        Iterable[(datetime, str)]
-            Iterator over timestamp, logline pairs.
+        Yields
+        ------
+        Tuple[datetime, str]
+            Tuple of timestamp, logline pairs.
         """
         from metaflow.mflog.mflog import merge_logs
 
@@ -1438,6 +1608,45 @@ class Task(MetaflowObject):
             ds_type, ds_root, stream, attempt, *self.path_components
         )
 
+    def __iter__(self) -> Iterator[DataArtifact]:
+        """
+        Iterate over all children DataArtifact of this Task
+
+        Yields
+        ------
+        DataArtifact
+            A DataArtifact in this Step
+        """
+        for d in super(Task, self).__iter__():
+            yield d
+
+    def __getitem__(self, name: str) -> DataArtifact:
+        """
+        Returns the DataArtifact object with the artifact name 'name'
+
+        Parameters
+        ----------
+        name : str
+            Data artifact name
+
+        Returns
+        -------
+        DataArtifact
+            DataArtifact for this artifact name in this task
+
+        Raises
+        ------
+        KeyError
+            If the name does not identify a valid DataArtifact object
+        """
+        return super(Task, self).__getitem__(name)
+
+    def __getstate__(self):
+        return super(Task, self).__getstate__()
+
+    def __setstate__(self, state):
+        super(Task, self).__setstate__(state)
+
 
 class Step(MetaflowObject):
     """
@@ -1492,10 +1701,10 @@ class Step(MetaflowObject):
         tags : str
             No op (legacy functionality)
 
-        Returns
-        -------
-        Iterable[Task]
-            Iterator over all `Task` objects in this step.
+        Yields
+        ------
+        Task
+            `Task` objects in this step.
         """
         return self._filtered_children(*tags)
 
@@ -1514,7 +1723,7 @@ class Step(MetaflowObject):
         """
         return next(self.control_tasks(), None)
 
-    def control_tasks(self, *tags: str) -> Iterable[Task]:
+    def control_tasks(self, *tags: str) -> Iterator[Task]:
         """
         [Unpublished API - use with caution!]
 
@@ -1526,10 +1735,11 @@ class Step(MetaflowObject):
         ----------
         tags : str
             Tags to match
-        Returns
-        -------
-        Iterable[Task]
-            Iterator over Control Task objects in this step
+
+        Yields
+        ------
+        Task
+            Control Task objects for this step
         """
         children = super(Step, self).__iter__()
         for child in children:
@@ -1550,10 +1760,44 @@ class Step(MetaflowObject):
                     ):
                         yield child
 
-    def __iter__(self):
-        children = super(Step, self).__iter__()
-        for t in children:
+    def __iter__(self) -> Iterator[Task]:
+        """
+        Iterate over all children Task of this Step
+
+        Yields
+        ------
+        Task
+            A Task in this Step
+        """
+        for t in super(Step, self).__iter__():
             yield t
+
+    def __getitem__(self, task_id: str) -> Task:
+        """
+        Returns the Task object with the task ID 'task_id'
+
+        Parameters
+        ----------
+        task_id : str
+            Task ID
+
+        Returns
+        -------
+        Task
+            Task for this task ID in this Step
+
+        Raises
+        ------
+        KeyError
+            If the task_id does not identify a valid Task object
+        """
+        return super(Step, self).__getitem__(task_id)
+
+    def __getstate__(self):
+        return super(Step, self).__getstate__()
+
+    def __setstate__(self, state):
+        super(Step, self).__setstate__(state)
 
     @property
     def finished_at(self) -> Optional[datetime]:
@@ -1610,6 +1854,8 @@ class Run(MetaflowObject):
         Time this run finished.
     code : MetaflowCode
         Code package for this run (if present). See `MetaflowCode`.
+    trigger : MetaflowTrigger
+        Information about event(s) that triggered this run (if present). See `MetaflowTrigger`.
     end_task : Task
         `Task` for the end step (if it is present already).
     """
@@ -1622,7 +1868,7 @@ class Run(MetaflowObject):
         # exclude _parameters step
         return x.id[0] != "_"
 
-    def steps(self, *tags: str) -> Iterable[Step]:
+    def steps(self, *tags: str) -> Iterator[Step]:
         """
         [Legacy function - do not use]
 
@@ -1637,10 +1883,10 @@ class Run(MetaflowObject):
         tags : str
             No op (legacy functionality)
 
-        Returns
-        -------
-        Iterable[Step]
-            Iterator over `Step` objects in this run.
+        Yields
+        ------
+        Step
+            `Step` objects in this run.
         """
         return self._filtered_children(*tags)
 
@@ -1648,16 +1894,24 @@ class Run(MetaflowObject):
     def code(self) -> Optional[MetaflowCode]:
         """
         Returns the MetaflowCode object for this run, if present.
-
-        Not all runs save their code so this call may return None in those cases.
+        Code is packed if atleast one `Step` runs remotely, else None is returned.
 
         Returns
         -------
         MetaflowCode, optional
             Code package for this run
         """
-        if "start" in self:
-            return self["start"].task.code
+        # Note that this can be quite slow in the edge-case where the codepackage is only available
+        # for the last step on the list. Steps are reverse-ordered, so the worst-case scenario is
+        # if the start step executes remotely and every step after that is remote.
+        #
+        # TODO: A more optimized way of figuring out if a run has remote steps (and thus a codepackage) available.
+        # This might require changes to the metadata-service as well.
+        for step in self:
+            if step.task:
+                code = step.task.code
+                if code:
+                    return code
 
     @property
     def data(self) -> Optional[MetaflowData]:
@@ -1868,6 +2122,63 @@ class Run(MetaflowObject):
         self._user_tags = frozenset(final_user_tags)
         self._tags = frozenset([*self._user_tags, *self._system_tags])
 
+    def __iter__(self) -> Iterator[Step]:
+        """
+        Iterate over all children Step of this Run
+
+        Yields
+        ------
+        Step
+            A Step in this Run
+        """
+        for s in super(Run, self).__iter__():
+            yield s
+
+    def __getitem__(self, name: str) -> Step:
+        """
+        Returns the Step object with the step name 'name'
+
+        Parameters
+        ----------
+        name : str
+            Step name
+
+        Returns
+        -------
+        Step
+            Step for this step name in this Run
+
+        Raises
+        ------
+        KeyError
+            If the name does not identify a valid Step object
+        """
+        return super(Run, self).__getitem__(name)
+
+    def __getstate__(self):
+        return super(Run, self).__getstate__()
+
+    def __setstate__(self, state):
+        super(Run, self).__setstate__(state)
+
+    @property
+    def trigger(self) -> Optional[Trigger]:
+        """
+        Returns a container of events that triggered this run.
+
+        This returns None if the run was not triggered by any events.
+
+        Returns
+        -------
+        Trigger, optional
+            Container of triggering events
+        """
+        if "start" in self and self["start"].task:
+            meta = self["start"].task.metadata_dict.get("execution-triggers")
+            if meta:
+                return Trigger(json.loads(meta))
+        return None
+
 
 class Flow(MetaflowObject):
     """
@@ -1919,7 +2230,7 @@ class Flow(MetaflowObject):
             if run.successful:
                 return run
 
-    def runs(self, *tags: str) -> Iterable[Run]:
+    def runs(self, *tags: str) -> Iterator[Run]:
         """
         Returns an iterator over all `Run`s of this flow.
 
@@ -1932,12 +2243,54 @@ class Flow(MetaflowObject):
         tags : str
             Tags to match.
 
-        Returns
-        -------
-        Iterable[Run]
-            Iterator over `Run` objects in this flow.
+        Yields
+        ------
+        Run
+            `Run` objects in this flow.
         """
         return self._filtered_children(*tags)
+
+    def __iter__(self) -> Iterator[Task]:
+        """
+        Iterate over all children Run of this Flow.
+
+        Note that only runs in the current namespace are returned unless
+        _namespace_check is False
+
+        Yields
+        ------
+        Run
+            A Run in this Flow
+        """
+        for r in super(Flow, self).__iter__():
+            yield r
+
+    def __getitem__(self, run_id: str) -> Run:
+        """
+        Returns the Run object with the run ID 'run_id'
+
+        Parameters
+        ----------
+        run_id : str
+            Run OD
+
+        Returns
+        -------
+        Run
+            Run for this run ID in this Flow
+
+        Raises
+        ------
+        KeyError
+            If the run_id does not identify a valid Run object
+        """
+        return super(Flow, self).__getitem__(run_id)
+
+    def __getstate__(self):
+        return super(Flow, self).__getstate__()
+
+    def __setstate__(self, state):
+        super(Flow, self).__setstate__(state)
 
 
 class Metaflow(object):
@@ -1955,17 +2308,16 @@ class Metaflow(object):
         if it has at least one run in the namespace.
     """
 
-    def __init__(self):
-        # the default namespace is activated lazily at the first object
-        # invocation or get_namespace(). The other option of activating
-        # the namespace at the import time is problematic, since there
-        # may be other modules that alter environment variables etc.
-        # which may affect the namescape setting.
-        if current_namespace is False:
-            default_namespace()
-        if current_metadata is False:
-            default_metadata()
-        self.metadata = current_metadata
+    def __init__(self, _current_metadata: Optional[str] = None):
+        if _current_metadata:
+            provider, info = _metadata(_current_metadata)
+            self.metadata = provider
+            if info:
+                self.metadata.INFO = info
+        else:
+            if current_metadata is False:
+                default_metadata()
+            self.metadata = current_metadata
 
     @property
     def flows(self) -> List[Flow]:
@@ -1982,12 +2334,12 @@ class Metaflow(object):
         """
         return list(self)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Flow]:
         """
         Iterator over all flows present.
 
-        Only flows present in the set namespace are returned. A flow is present in a namespace if
-        it has at least one run that is in the namespace.
+        Only flows present in the set namespace are returned. A flow is present in a
+        namespace if it has at least one run that is in the namespace.
 
         Yields
         -------
@@ -2002,15 +2354,15 @@ class Metaflow(object):
         all_flows = all_flows if all_flows else []
         for flow in all_flows:
             try:
-                v = Flow(_object=flow)
+                v = Flow(_object=flow, _metaflow=self)
                 yield v
             except MetaflowNamespaceMismatch:
                 continue
 
-    def __str__(self):
+    def __str__(self) -> str:
         return "Metaflow()"
 
-    def __getitem__(self, id: str) -> Flow:
+    def __getitem__(self, name: str) -> Flow:
         """
         Returns a specific flow by name.
 
@@ -2018,15 +2370,34 @@ class Metaflow(object):
 
         Parameters
         ----------
-        id : string
+        name : str
             Name of the Flow
 
         Returns
         -------
         Flow
-            Flow with the given ID.
+            Flow with the given name.
         """
-        return Flow(id)
+        return Flow(name, _metaflow=self)
+
+
+def _metadata(ms: str) -> Tuple[Optional["MetadataProvider"], Optional[str]]:
+    infos = ms.split("@", 1)
+    types = [m.TYPE for m in METADATA_PROVIDERS]
+    if infos[0] in types:
+        provider = [m for m in METADATA_PROVIDERS if m.TYPE == infos[0]][0]
+        if len(infos) > 1:
+            return provider, infos[1]
+        return provider, None
+    # Deduce from ms; if starts with http, use service or else use local
+    if ms.startswith("http"):
+        metadata_type = "service"
+    else:
+        metadata_type = "local"
+    res = [m for m in METADATA_PROVIDERS if m.TYPE == metadata_type]
+    if not res:
+        return None, None
+    return res[0], ms
 
 
 _CLASSES["flow"] = Flow
