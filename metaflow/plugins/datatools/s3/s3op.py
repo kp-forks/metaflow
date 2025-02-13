@@ -43,8 +43,10 @@ from metaflow.plugins.datatools.s3.s3util import (
     TRANSIENT_RETRY_LINE_CONTENT,
     TRANSIENT_RETRY_START_LINE,
 )
-
-NUM_WORKERS_DEFAULT = 64
+import metaflow.tracing as tracing
+from metaflow.metaflow_config import (
+    S3_WORKER_COUNT,
+)
 
 DOWNLOAD_FILE_THRESHOLD = 2 * TransferConfig().multipart_threshold
 DOWNLOAD_MAX_CHUNK = 2 * 1024 * 1024 * 1024 - 1
@@ -63,6 +65,7 @@ class S3Url(object):
         local,
         prefix,
         content_type=None,
+        encryption=None,
         metadata=None,
         range=None,
         idx=None,
@@ -77,6 +80,7 @@ class S3Url(object):
         self.metadata = metadata
         self.range = range
         self.idx = idx
+        self.encryption = encryption
 
     def __str__(self):
         return self.url
@@ -151,6 +155,7 @@ def normalize_client_error(err):
 # S3 worker pool
 
 
+@tracing.cli("s3op/worker")
 def worker(result_file_name, queue, mode, s3config):
     # Interpret mode, it can either be a single op or something like
     # info_download or info_upload which implies:
@@ -171,6 +176,7 @@ def worker(result_file_name, queue, mode, s3config):
                 "error": None,
                 "size": head["ContentLength"],
                 "content_type": head["ContentType"],
+                "encryption": head.get("ServerSideEncryption"),
                 "metadata": head["Metadata"],
                 "last_modified": get_timestamp(head["LastModified"]),
             }
@@ -276,6 +282,8 @@ def worker(result_file_name, queue, mode, s3config):
                                 args["content_type"] = resp["ContentType"]
                             if resp["Metadata"] is not None:
                                 args["metadata"] = resp["Metadata"]
+                            if resp.get("ServerSideEncryption") is not None:
+                                args["encryption"] = resp["ServerSideEncryption"]
                             if resp["LastModified"]:
                                 args["last_modified"] = get_timestamp(
                                     resp["LastModified"]
@@ -299,12 +307,14 @@ def worker(result_file_name, queue, mode, s3config):
                         do_upload = True
                     if do_upload:
                         extra = None
-                        if url.content_type or url.metadata:
+                        if url.content_type or url.metadata or url.encryption:
                             extra = {}
                             if url.content_type:
                                 extra["ContentType"] = url.content_type
                             if url.metadata is not None:
                                 extra["Metadata"] = url.metadata
+                            if url.encryption is not None:
+                                extra["ServerSideEncryption"] = url.encryption
                         try:
                             s3.upload_file(
                                 url.local, url.bucket, url.path, ExtraArgs=extra
@@ -461,6 +471,7 @@ class S3Ops(object):
                             prefix=url.prefix,
                             content_type=head["ContentType"],
                             metadata=head["Metadata"],
+                            encryption=head.get("ServerSideEncryption"),
                             range=url.range,
                         ),
                         head["ContentLength"],
@@ -578,7 +589,7 @@ def verify_results(urls, verbose=False):
             raise
         if expected != got:
             exit(ERROR_VERIFY_FAILED, url)
-        if url.content_type or url.metadata:
+        if url.content_type or url.metadata or url.encryption:
             # Verify that we also have a metadata file present
             try:
                 os.stat("%s_meta" % url.local)
@@ -646,7 +657,7 @@ def common_options(func):
     )
     @click.option(
         "--num-workers",
-        default=NUM_WORKERS_DEFAULT,
+        default=S3_WORKER_COUNT,
         show_default=True,
         help="Number of concurrent connections.",
     )
@@ -712,6 +723,7 @@ def cli():
 
 
 @cli.command("list", help="List S3 objects")
+@tracing.cli("s3op/list")
 @click.option(
     "--recursive/--no-recursive",
     default=False,
@@ -771,6 +783,7 @@ def lst(
 
 
 @cli.command(help="Upload files to S3")
+@tracing.cli("s3op/put")
 @click.option(
     "--file",
     "files",
@@ -838,11 +851,12 @@ def put(
                 url = r["url"]
                 content_type = r.get("content_type", None)
                 metadata = r.get("metadata", None)
+                encryption = r.get("encryption", None)
                 if not os.path.exists(local):
                     exit(ERROR_LOCAL_FILE_NOT_FOUND, local)
-                yield input_line_idx, local, url, content_type, metadata
+                yield input_line_idx, local, url, content_type, metadata, encryption
 
-    def _make_url(idx, local, user_url, content_type, metadata):
+    def _make_url(idx, local, user_url, content_type, metadata, encryption):
         src = urlparse(user_url)
         url = S3Url(
             url=user_url,
@@ -853,6 +867,7 @@ def put(
             content_type=content_type,
             metadata=metadata,
             idx=idx,
+            encryption=encryption,
         )
         if src.scheme != "s3":
             exit(ERROR_INVALID_URL, url)
@@ -896,6 +911,7 @@ def put(
                         "local": url.local,
                         "content_type": url.content_type,
                         "metadata": url.metadata,
+                        "encryption": url.encryption,
                     }
                 )
                 + "\n"
@@ -962,6 +978,7 @@ def _populate_prefixes(prefixes, inputs):
 
 
 @cli.command(help="Download files from S3")
+@tracing.cli("s3op/get")
 @click.option(
     "--recursive/--no-recursive",
     default=False,
@@ -1102,9 +1119,11 @@ def get(
                         str(url.idx),
                         url_quote(url.prefix).decode(encoding="utf-8"),
                         url_quote(url.url).decode(encoding="utf-8"),
-                        url_quote(url.range).decode(encoding="utf-8")
-                        if url.range
-                        else "<norange>",
+                        (
+                            url_quote(url.range).decode(encoding="utf-8")
+                            if url.range
+                            else "<norange>"
+                        ),
                     ]
                 )
                 + "\n"

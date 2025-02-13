@@ -12,14 +12,15 @@ from tempfile import mkdtemp, NamedTemporaryFile
 from typing import Dict, Iterable, List, Optional, Tuple, Union, TYPE_CHECKING
 
 from metaflow import FlowSpec
-from metaflow.current import current
+from metaflow.metaflow_current import current
 from metaflow.metaflow_config import (
     DATATOOLS_S3ROOT,
     S3_RETRY_COUNT,
     S3_TRANSIENT_RETRY_COUNT,
+    S3_SERVER_SIDE_ENCRYPTION,
+    TEMPDIR,
 )
 from metaflow.util import (
-    namedtuple_with_defaults,
     is_stringish,
     to_bytes,
     to_unicode,
@@ -27,8 +28,10 @@ from metaflow.util import (
     url_quote,
     url_unquote,
 )
+from metaflow.tuple_util import namedtuple_with_defaults
 from metaflow.exception import MetaflowException
 from metaflow.debug import debug
+import metaflow.tracing as tracing
 
 try:
     # python2
@@ -46,17 +49,27 @@ from .s3util import (
 )
 
 if TYPE_CHECKING:
-    from metaflow.client import Run
+    import metaflow
 
-try:
-    import boto3
-    from boto3.s3.transfer import TransferConfig
 
-    DOWNLOAD_FILE_THRESHOLD = 2 * TransferConfig().multipart_threshold
-    DOWNLOAD_MAX_CHUNK = 2 * 1024 * 1024 * 1024 - 1
-    boto_found = True
-except:
-    boto_found = False
+def _check_and_init_s3_deps():
+    try:
+        import boto3
+        from boto3.s3.transfer import TransferConfig
+    except (ImportError, ModuleNotFoundError):
+        raise MetaflowException("You need to install 'boto3' in order to use S3.")
+
+
+def check_s3_deps(func):
+    """The decorated function checks S3 dependencies (as needed for AWS S3 storage backend).
+    This includes boto3.
+    """
+
+    def _inner_func(*args, **kwargs):
+        _check_and_init_s3_deps()
+        return func(*args, **kwargs)
+
+    return _inner_func
 
 
 TEST_INJECT_RETRYABLE_FAILURES = int(
@@ -82,9 +95,10 @@ S3PutObject = namedtuple_with_defaults(
         ("value", Optional[PutValue]),
         ("path", Optional[str]),
         ("content_type", Optional[str]),
+        ("encryption", Optional[str]),
         ("metadata", Optional[Dict[str, str]]),
     ],
-    defaults=(None, None, None, None),
+    defaults=(None, None, None, None, None),
 )
 S3PutObject.__module__ = __name__
 
@@ -140,9 +154,9 @@ class S3Object(object):
         content_type: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
         range_info: Optional[RangeInfo] = None,
-        last_modified: int = None,
+        last_modified: Optional[int] = None,
+        encryption: Optional[str] = None,
     ):
-
         # all fields of S3Object should return a unicode object
         prefix, url, path = map(ensure_unicode, (prefix, url, path))
 
@@ -175,6 +189,8 @@ class S3Object(object):
         else:
             self._key = url[len(prefix.rstrip("/")) + 1 :].rstrip("/")
             self._prefix = prefix
+
+        self._encryption = encryption
 
     @property
     def exists(self) -> bool:
@@ -321,6 +337,7 @@ class S3Object(object):
             self._content_type is not None
             or self._metadata is not None
             or self._range_info is not None
+            or self._encryption is not None
         )
 
     @property
@@ -347,6 +364,18 @@ class S3Object(object):
             Content type or None if the content type is undefined.
         """
         return self._content_type
+
+    @property
+    def encryption(self) -> Optional[str]:
+        """
+        Returns the encryption type of the S3 object or None if it is not defined.
+
+        Returns
+        -------
+        str
+            Server-side-encryption type or None if parameter is not set.
+        """
+        return self._encryption
 
     @property
     def range_info(self) -> Optional[RangeInfo]:
@@ -475,24 +504,29 @@ class S3(object):
         If `run` is not specified, use this as the S3 prefix.
     """
 
+    TYPE = "s3"
+
     @classmethod
     def get_root_from_config(cls, echo, create_on_absent=True):
         return DATATOOLS_S3ROOT
 
+    @check_s3_deps
     def __init__(
         self,
-        tmproot: str = ".",
+        tmproot: str = TEMPDIR,
         bucket: Optional[str] = None,
         prefix: Optional[str] = None,
-        run: Optional[Union[FlowSpec, "Run"]] = None,
+        run: Optional[Union[FlowSpec, "metaflow.Run"]] = None,
         s3root: Optional[str] = None,
+        encryption: Optional[str] = S3_SERVER_SIDE_ENCRYPTION,
         **kwargs
     ):
-        if not boto_found:
-            raise MetaflowException("You need to install 'boto3' in order to use S3.")
-
         if run:
             # 1. use a (current) run ID with optional customizations
+            if DATATOOLS_S3ROOT is None:
+                raise MetaflowS3URLException(
+                    "DATATOOLS_S3ROOT is not configured when trying to use S3 storage"
+                )
             parsed = urlparse(DATATOOLS_S3ROOT)
             if not bucket:
                 bucket = parsed.netloc
@@ -539,6 +573,7 @@ class S3(object):
             "inject_failure_rate", TEST_INJECT_RETRYABLE_FAILURES
         )
         self._tmpdir = mkdtemp(dir=tmproot, prefix="metaflow.s3.")
+        self._encryption = encryption
 
     def __enter__(self) -> "S3":
         return self
@@ -565,7 +600,9 @@ class S3(object):
         # returned are Unicode.
         key = getattr(key_value, "key", key_value)
         if self._s3root is None:
-            parsed = urlparse(to_unicode(key))
+            # NOTE: S3 allows fragments as part of object names, e.g. /dataset #1/data.txt
+            # Without allow_fragments=False the parsed.path for an object name with fragments is incomplete.
+            parsed = urlparse(to_unicode(key), allow_fragments=False)
             if parsed.scheme == "s3" and parsed.path:
                 return key
             else:
@@ -638,12 +675,12 @@ class S3(object):
 
         Parameters
         ----------
-        keys : Iterable[str], optional
+        keys : Iterable[str], optional, default None
             List of paths.
 
         Returns
         -------
-        List[`S3Object`]
+        List[S3Object]
             S3Objects under the given paths, including prefixes (directories) that
             do not correspond to leaf objects.
         """
@@ -687,12 +724,12 @@ class S3(object):
 
         Parameters
         ----------
-        keys : Iterable[str], optional
+        keys : Iterable[str], optional, default None
             List of paths.
 
         Returns
         -------
-        List[`S3Object`]
+        List[S3Object]
             S3Objects under the given paths.
         """
 
@@ -716,21 +753,23 @@ class S3(object):
 
         Parameters
         ----------
-        key : str, optional
+        key : str, optional, default None
             Object to query. It can be an S3 url or a path suffix.
-        return_missing : bool, default: False
+        return_missing : bool, default False
             If set to True, do not raise an exception for a missing key but
             return it as an `S3Object` with `.exists == False`.
 
         Returns
         -------
-        `S3Object`
+        S3Object
             An S3Object corresponding to the object requested. The object
             will have `.downloaded == False`.
         """
 
         url = self._url(key)
-        src = urlparse(url)
+        # NOTE: S3 allows fragments as part of object names, e.g. /dataset #1/data.txt
+        # Without allow_fragments=False the parsed src.path for an object name with fragments is incomplete.
+        src = urlparse(url, allow_fragments=False)
 
         def _info(s3, tmp):
             resp = s3.head_object(Bucket=src.netloc, Key=src.path.lstrip('/"'))
@@ -739,6 +778,7 @@ class S3(object):
                 "metadata": resp["Metadata"],
                 "size": resp["ContentLength"],
                 "last_modified": get_timestamp(resp["LastModified"]),
+                "encryption": resp.get("ServerSideEncryption"),
             }
 
         info_results = None
@@ -758,6 +798,7 @@ class S3(object):
                 content_type=info_results["content_type"],
                 metadata=info_results["metadata"],
                 last_modified=info_results["last_modified"],
+                encryption=info_results["encryption"],
             )
         return S3Object(self._s3root, url, None)
 
@@ -774,14 +815,14 @@ class S3(object):
         ----------
         keys : Iterable[str]
             Objects to query. Each key can be an S3 url or a path suffix.
-        return_missing : bool, default: False
+        return_missing : bool, default False
             If set to True, do not raise an exception for a missing key but
             return it as an `S3Object` with `.exists == False`.
 
         Returns
         -------
-        List[`S3Object`]
-            A list of `S3Object`s corresponding to the paths requested. The
+        List[S3Object]
+            A list of S3Objects corresponding to the paths requested. The
             objects will have `.downloaded == False`.
         """
 
@@ -811,7 +852,9 @@ class S3(object):
                     else:
                         yield self._s3root, s3url, None, info["size"], info[
                             "content_type"
-                        ], info["metadata"], None, info["last_modified"]
+                        ], info["metadata"], None, info["last_modified"], info[
+                            "encryption"
+                        ]
                 else:
                     # This should not happen; we should always get a response
                     # even if it contains an error inside it
@@ -830,24 +873,31 @@ class S3(object):
 
         Parameters
         ----------
-        key : str or `S3GetObject`, optional
+        key : Union[str, S3GetObject], optional, default None
             Object to download. It can be an S3 url, a path suffix, or
-            an `S3GetObject` that defines a range of data to download. If None, or
+            an S3GetObject that defines a range of data to download. If None, or
             not provided, gets the S3 root.
-        return_missing : bool, default: False
+        return_missing : bool, default False
             If set to True, do not raise an exception for a missing key but
             return it as an `S3Object` with `.exists == False`.
-        return_info : bool, default: True
+        return_info : bool, default True
             If set to True, fetch the content-type and user metadata associated
             with the object at no extra cost, included for symmetry with `get_many`
 
         Returns
         -------
-        `S3Object`
+        S3Object
             An S3Object corresponding to the object requested.
         """
+        from boto3.s3.transfer import TransferConfig
+
+        DOWNLOAD_FILE_THRESHOLD = 2 * TransferConfig().multipart_threshold
+        DOWNLOAD_MAX_CHUNK = 2 * 1024 * 1024 * 1024 - 1
+
         url, r = self._url_and_range(key)
-        src = urlparse(url)
+        # NOTE: S3 allows fragments as part of object names, e.g. /dataset #1/data.txt
+        # Without allow_fragments=False the parsed src.path for an object name with fragments is incomplete.
+        src = urlparse(url, allow_fragments=False)
 
         def _download(s3, tmp):
             if r:
@@ -886,6 +936,12 @@ class S3(object):
             if return_info:
                 return {
                     "content_type": resp["ContentType"],
+                    # Since Metaflow can also use S3-compatible storage like MinIO,
+                    # there maybe some keys missing in the responses given by different S3-compatible object stores.
+                    # MinIO is generally accessed via HTTPS, and so it's encrpytion scheme is
+                    # TLS/SSL. This is why the `ServerSideEncryption` key is not present
+                    # in the response from MinIO.
+                    "encryption": resp.get("ServerSideEncryption"),
                     "metadata": resp["Metadata"],
                     "range_result": range_result,
                     "last_modified": get_timestamp(resp["LastModified"]),
@@ -906,6 +962,7 @@ class S3(object):
                 url,
                 path,
                 content_type=addl_info["content_type"],
+                encryption=addl_info["encryption"],
                 metadata=addl_info["metadata"],
                 range_info=addl_info["range_result"],
                 last_modified=addl_info["last_modified"],
@@ -923,19 +980,19 @@ class S3(object):
 
         Parameters
         ----------
-        keys : Iterable[str or `S3GetObject`]
+        keys : Iterable[Union[str, S3GetObject]]
             Objects to download. Each object can be an S3 url, a path suffix, or
-            an `S3GetObject` that defines a range of data to download.
-        return_missing : bool, default: False
+            an S3GetObject that defines a range of data to download.
+        return_missing : bool, default False
             If set to True, do not raise an exception for a missing key but
             return it as an `S3Object` with `.exists == False`.
-        return_info : bool, default: True
+        return_info : bool, default True
             If set to True, fetch the content-type and user metadata associated
             with the object at no extra cost, included for symmetry with `get_many`.
 
         Returns
         -------
-        List[`S3Object`]
+        List[S3Object]
             S3Objects corresponding to the objects requested.
         """
 
@@ -967,13 +1024,15 @@ class S3(object):
                                 - range_info["start"]
                                 + 1,
                             )
-                        yield self._s3root, s3url, os.path.join(
-                            self._tmpdir, fname
-                        ), None, info["content_type"], info[
-                            "metadata"
-                        ], range_info, info[
-                            "last_modified"
-                        ]
+                            yield self._s3root, s3url, os.path.join(
+                                self._tmpdir, fname
+                            ), None, info["content_type"], info[
+                                "metadata"
+                            ], range_info, info[
+                                "last_modified"
+                            ], info.get(
+                                "encryption"
+                            )
                     else:
                         yield self._s3root, s3prefix, None
                 else:
@@ -996,13 +1055,13 @@ class S3(object):
         keys : Iterable[str]
             Prefixes to download recursively. Each prefix can be an S3 url or a path suffix
             which define the root prefix under which all objects are downloaded.
-        return_info : bool, default: False
+        return_info : bool, default False
             If set to True, fetch the content-type and user metadata associated
             with the object.
 
         Returns
         -------
-        List[`S3Object`]
+        List[S3Object]
             S3Objects stored under the given prefixes.
         """
 
@@ -1033,7 +1092,9 @@ class S3(object):
                         self._tmpdir, fname
                     ), None, info["content_type"], info["metadata"], range_info, info[
                         "last_modified"
-                    ]
+                    ], info.get(
+                        "encryption"
+                    )
                 else:
                     yield s3prefix, s3url, os.path.join(self._tmpdir, fname)
 
@@ -1048,13 +1109,13 @@ class S3(object):
 
         Parameters
         ----------
-        return_info : bool, default: False
+        return_info : bool, default False
             If set to True, fetch the content-type and user metadata associated
             with the object.
 
         Returns
         -------
-        Iterable[`S3Object`]
+        Iterable[S3Object]
             S3Objects stored under the main prefix.
         """
 
@@ -1078,16 +1139,16 @@ class S3(object):
 
         Parameters
         ----------
-        key : str or `S3PutObject`
+        key : Union[str, S3PutObject]
             Object path. It can be an S3 url or a path suffix.
-        obj : bytes or str
+        obj : PutValue
             An object to store in S3. Strings are converted to UTF-8 encoding.
-        overwrite : bool, default: True
+        overwrite : bool, default True
             Overwrite the object if it exists. If set to False, the operation
             succeeds without uploading anything if the key already exists.
-        content_type : str, optional
+        content_type : str, optional, default None
             Optional MIME type for the object.
-        metadata : Dict, optional
+        metadata : Dict[str, str], optional, default None
             A JSON-encodable dictionary of additional headers to be stored
             as metadata with the object.
 
@@ -1118,9 +1179,11 @@ class S3(object):
         blob.close = lambda: None
 
         url = self._url(key)
-        src = urlparse(url)
+        # NOTE: S3 allows fragments as part of object names, e.g. /dataset #1/data.txt
+        # Without allow_fragments=False the parsed src.path for an object name with fragments is incomplete.
+        src = urlparse(url, allow_fragments=False)
         extra_args = None
-        if content_type or metadata:
+        if content_type or metadata or self._encryption:
             extra_args = {}
             if content_type:
                 extra_args["ContentType"] = content_type
@@ -1128,13 +1191,20 @@ class S3(object):
                 extra_args["Metadata"] = {
                     "metaflow-user-attributes": json.dumps(metadata)
                 }
+            if self._encryption:
+                extra_args["ServerSideEncryption"] = self._encryption
 
         def _upload(s3, _):
             # We make sure we are at the beginning in case we are retrying
             blob.seek(0)
-            s3.upload_fileobj(
-                blob, src.netloc, src.path.lstrip("/"), ExtraArgs=extra_args
-            )
+
+            # We use manual tracing here because boto3 instrumentation
+            # has an issue with upload_fileobj losing track of tracing context
+            # https://github.com/open-telemetry/opentelemetry-python-contrib/issues/298
+            with tracing.traced("s3.upload_fileobj", {"path": src.path}):
+                s3.upload_fileobj(
+                    blob, src.netloc, src.path.lstrip("/"), ExtraArgs=extra_args
+                )
 
         if overwrite:
             self._one_boto_op(_upload, url, create_tmp_file=False)
@@ -1171,26 +1241,26 @@ class S3(object):
 
         Parameters
         ----------
-        key_objs : List[(str, str) or `S3PutObject`]
+        key_objs : List[Union[Tuple[str, PutValue], S3PutObject]]
             List of key-object pairs to upload.
-        overwrite : bool, default : True
+        overwrite : bool, default True
             Overwrite the object if it exists. If set to False, the operation
             succeeds without uploading anything if the key already exists.
 
         Returns
         -------
-        List[(str, str)]
+        List[Tuple[str, str]]
             List of `(key, url)` pairs corresponding to the objects uploaded.
         """
 
         def _store():
             for key_obj in key_objs:
-                if isinstance(key_obj, tuple):
-                    key = key_obj[0]
-                    obj = key_obj[1]
-                else:
+                if isinstance(key_obj, S3PutObject):
                     key = key_obj.key
                     obj = key_obj.value
+                else:
+                    key = key_obj[0]
+                    obj = key_obj[1]
                 store_info = {
                     "key": key,
                     "content_type": getattr(key_obj, "content_type", None),
@@ -1200,6 +1270,8 @@ class S3(object):
                     store_info["metadata"] = {
                         "metaflow-user-attributes": json.dumps(metadata)
                     }
+                if self._encryption:
+                    store_info["encryption"] = self._encryption
                 if isinstance(obj, (RawIOBase, BufferedIOBase)):
                     if not obj.readable() or not obj.seekable():
                         raise MetaflowS3InvalidObject(
@@ -1243,26 +1315,26 @@ class S3(object):
 
         Parameters
         ----------
-        key_paths : List[(str, str) or `S3PutObject`]
+        key_paths :  List[Union[Tuple[str, PutValue], S3PutObject]]
             List of files to upload.
-        overwrite : bool, default: True
+        overwrite : bool, default True
             Overwrite the object if it exists. If set to False, the operation
             succeeds without uploading anything if the key already exists.
 
         Returns
         -------
-        List[(str, str)]
+        List[Tuple[str, str]]
             List of `(key, url)` pairs corresponding to the files uploaded.
         """
 
         def _check():
             for key_path in key_paths:
-                if isinstance(key_path, tuple):
-                    key = key_path[0]
-                    path = key_path[1]
-                else:
+                if isinstance(key_path, S3PutObject):
                     key = key_path.key
                     path = key_path.path
+                else:
+                    key = key_path[0]
+                    path = key_path[1]
                 store_info = {
                     "key": key,
                     "content_type": getattr(key_path, "content_type", None),
@@ -1272,6 +1344,8 @@ class S3(object):
                     store_info["metadata"] = {
                         "metaflow-user-attributes": json.dumps(metadata)
                     }
+                if self._encryption:
+                    store_info["encryption"] = self._encryption
                 if not os.path.exists(path):
                     raise MetaflowS3NotFound("Local file not found: %s" % path)
                 yield path, self._url(key), store_info
@@ -1560,10 +1634,14 @@ class S3(object):
                     try:
                         debug.s3client_exec(cmdline + addl_cmdline)
                         # Run the operation.
+                        env = os.environ.copy()
+                        tracing.inject_tracing_vars(env)
+                        env["METAFLOW_ESCAPE_HATCH_WARNING"] = "False"
                         stdout = subprocess.check_output(
                             cmdline + addl_cmdline,
                             cwd=self._tmpdir,
                             stderr=stderr.file,
+                            env=env,
                         )
                         # Here we did not have any error -- transient or otherwise.
                         ok_lines = stdout.splitlines()

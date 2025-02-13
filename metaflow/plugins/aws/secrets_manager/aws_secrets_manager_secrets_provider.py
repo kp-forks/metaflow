@@ -37,36 +37,40 @@ def _sanitize_key_as_env_var(key):
     Also, it's TBD whether all possible providers will share the same sanitization logic.
     Therefore we will keep this function private for now
     """
-    return key.replace("-", "_").replace(".", "_")
+    return key.replace("-", "_").replace(".", "_").replace("/", "_")
 
 
 class AwsSecretsManagerSecretsProvider(SecretsProvider):
     TYPE = "aws-secrets-manager"
 
-    def get_secret_as_dict(self, secret_id, options={}):
+    def get_secret_as_dict(self, secret_id, options={}, role=None):
         """
         Reads a secret from AWS Secrets Manager and returns it as a dictionary of environment variables.
 
         The secret payload from AWS is EITHER a string OR a binary blob.
 
         If the secret contains a string payload ("SecretString"):
-        - if the `parse_secret_string_as_json` option is True (default):
+        - if the `json` option is True (default):
             {SecretString} will be parsed as a JSON. If successfully parsed, AND the JSON contains a
             top-level object, each entry K/V in the object will also be converted to an entry in the result. V will
             always be casted to a string (if not already a string).
-        - If `parse_secret_string_as_json` option is False:
-            {SecretString} will be returned as a single entry in the result, with the key being the secret_id.
+        - If `json` option is False:
+            {SecretString} will be returned as a single entry in the result, where the key is either:
+                - the `secret_id`, OR
+                - the value set by `options={"env_var_name": custom_env_var_name}`.
 
-        Otherwise, the secret contains a binary blob payload ("SecretBinary"). In this case
-        - The result dic contains '{SecretName}': '{SecretBinary}', where {SecretBinary} is a base64-encoded string
+        Otherwise, if the secret contains a binary blob payload ("SecretBinary"):
+        - The result dict contains '{SecretName}': '{SecretBinary}', where {SecretBinary} is a base64-encoded string.
 
-        All keys in the result are sanitized to be more valid environment variable names. This is done on a best effort
+        All keys in the result are sanitized to be more valid environment variable names. This is done on a best-effort
         basis. Further validation is expected to be done by the invoking @secrets decorator itself.
 
-        :param secret_id: ARN or friendly name of the secret
-        :param options: unused
-        :return: dict of environment variables. All keys and values are strings.
+        :param secret_id: ARN or friendly name of the secret.
+        :param options: Dictionary of additional options. E.g., `options={"env_var_name": custom_env_var_name}`.
+        :param role: AWS IAM Role ARN to assume before reading the secret.
+        :return: Dictionary of environment variables. All keys and values are strings.
         """
+
         import botocore
         from metaflow.plugins.aws.aws_client import get_aws_client
 
@@ -79,12 +83,15 @@ class AwsSecretsManagerSecretsProvider(SecretsProvider):
             effective_aws_region = options["region"]
         else:
             effective_aws_region = AWS_SECRETS_MANAGER_DEFAULT_REGION
+
         # At the end of all that, `effective_aws_region` may still be None.
         # This might still be OK, if there is fallback AWS region info in environment like:
         # .aws/config or AWS_REGION env var or AWS_DEFAULT_REGION env var, etc.
         try:
             secrets_manager_client = get_aws_client(
-                "secretsmanager", client_params={"region_name": effective_aws_region}
+                "secretsmanager",
+                client_params={"region_name": effective_aws_region},
+                role_arn=role,
             )
         except botocore.exceptions.NoRegionError:
             # We try our best with a nice error message.
@@ -143,7 +150,11 @@ class AwsSecretsManagerSecretsProvider(SecretsProvider):
                         "Secret string could not be parsed as JSON"
                     )
             else:
-                _sanitize_and_add_entry_to_result(secret_name, secret_str)
+                if options.get("env_var_name"):
+                    env_var_name = options["env_var_name"]
+                else:
+                    env_var_name = secret_name
+                _sanitize_and_add_entry_to_result(env_var_name, secret_str)
 
         elif "SecretBinary" in response:
             # boto3 docs say response gives base64 encoded, but it's wrong.
@@ -153,8 +164,12 @@ class AwsSecretsManagerSecretsProvider(SecretsProvider):
             # bytes.
             #
             # The trailing decode gives us a final UTF-8 string.
+            if options.get("env_var_name"):
+                env_var_name = options["env_var_name"]
+            else:
+                env_var_name = secret_name
             _sanitize_and_add_entry_to_result(
-                secret_name, base64.b64encode(response["SecretBinary"]).decode()
+                env_var_name, base64.b64encode(response["SecretBinary"]).decode()
             )
         else:
             raise MetaflowAWSSecretsManagerBadResponse(

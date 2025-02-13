@@ -8,9 +8,12 @@ from metaflow.plugins import DATASTORES
 from metaflow.util import Path
 from . import TASK_LOG_SOURCE
 
+from metaflow.tracing import cli
+
 SMALL_FILE_LIMIT = 1024 * 1024
 
 
+@cli("save_logs")
 def save_logs():
     def _read_file(path):
         with open(path, "rb") as f:

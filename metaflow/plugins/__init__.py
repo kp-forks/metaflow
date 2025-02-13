@@ -1,6 +1,8 @@
+import sys
+
 from metaflow.extension_support.plugins import (
-    process_plugins,
     merge_lists,
+    process_plugins,
     resolve_plugins,
 )
 
@@ -14,7 +16,14 @@ CLIS_DESC = [
     ("argo-workflows", ".argo.argo_workflows_cli.cli"),
     ("card", ".cards.card_cli.cli"),
     ("tag", ".tag_cli.cli"),
+    ("spot-metadata", ".kubernetes.spot_metadata_cli.cli"),
+    ("logs", ".logs_cli.cli"),
 ]
+
+# Add additional commands to the runner here
+# These will be accessed using Runner().<command>()
+RUNNER_CLIS_DESC = []
+
 
 from .test_unbounded_foreach_decorator import InternalTestUnboundedForeachInput
 
@@ -41,10 +50,11 @@ STEP_DECORATORS_DESC = [
         "unbounded_test_foreach_internal",
         ".test_unbounded_foreach_decorator.InternalTestUnboundedForeachDecorator",
     ),
-    ("conda", ".conda.conda_step_decorator.CondaStepDecorator"),
     ("card", ".cards.card_decorator.CardDecorator"),
     ("pytorch_parallel", ".frameworks.pytorch.PytorchParallelDecorator"),
     ("airflow_internal", ".airflow.airflow_decorator.AirflowInternalDecorator"),
+    ("pypi", ".pypi.pypi_decorator.PyPIStepDecorator"),
+    ("conda", ".pypi.conda_decorator.CondaStepDecorator"),
 ]
 
 # Add new flow decorators here
@@ -53,18 +63,24 @@ STEP_DECORATORS_DESC = [
 # careful with the choice of name though - they become top-level
 # imports from the metaflow package.
 FLOW_DECORATORS_DESC = [
-    ("conda_base", ".conda.conda_flow_decorator.CondaFlowDecorator"),
     ("schedule", ".aws.step_functions.schedule_decorator.ScheduleDecorator"),
     ("project", ".project_decorator.ProjectDecorator"),
+    ("trigger", ".events_decorator.TriggerDecorator"),
+    ("trigger_on_finish", ".events_decorator.TriggerOnFinishDecorator"),
+    ("pypi_base", ".pypi.pypi_decorator.PyPIFlowDecorator"),
+    ("conda_base", ".pypi.conda_decorator.CondaFlowDecorator"),
 ]
 
 # Add environments here
-ENVIRONMENTS_DESC = [("conda", ".conda.conda_environment.CondaEnvironment")]
+ENVIRONMENTS_DESC = [
+    ("conda", ".pypi.conda_environment.CondaEnvironment"),
+    ("pypi", ".pypi.pypi_environment.PyPIEnvironment"),
+]
 
 # Add metadata providers here
 METADATA_PROVIDERS_DESC = [
-    ("service", ".metadata.service.ServiceMetadataProvider"),
-    ("local", ".metadata.local.LocalMetadataProvider"),
+    ("service", ".metadata_providers.service.ServiceMetadataProvider"),
+    ("local", ".metadata_providers.local.LocalMetadataProvider"),
 ]
 
 # Add datastore here
@@ -75,13 +91,25 @@ DATASTORES_DESC = [
     ("gs", ".datastores.gs_storage.GSStorage"),
 ]
 
+# Dataclients are used for IncludeFile
+DATACLIENTS_DESC = [
+    ("local", ".datatools.Local"),
+    ("s3", ".datatools.S3"),
+    ("azure", ".azure.includefile_support.Azure"),
+    ("gs", ".gcp.includefile_support.GS"),
+]
+
 # Add non monitoring/logging sidecars here
 SIDECARS_DESC = [
     (
         "save_logs_periodically",
         "..mflog.save_logs_periodically.SaveLogsPeriodicallySidecar",
     ),
-    ("heartbeat", "metaflow.metadata.heartbeat.MetadataHeartBeat"),
+    (
+        "spot_termination_monitor",
+        ".kubernetes.spot_monitor_sidecar.SpotTerminationMonitorSidecar",
+    ),
+    ("heartbeat", "metaflow.metadata_provider.heartbeat.MetadataHeartBeat"),
 ]
 
 # Add logging sidecars here
@@ -113,6 +141,30 @@ SECRETS_PROVIDERS_DESC = [
         "aws-secrets-manager",
         ".aws.secrets_manager.aws_secrets_manager_secrets_provider.AwsSecretsManagerSecretsProvider",
     ),
+    (
+        "gcp-secret-manager",
+        ".gcp.gcp_secret_manager_secrets_provider.GcpSecretManagerSecretsProvider",
+    ),
+    (
+        "az-key-vault",
+        ".azure.azure_secret_manager_secrets_provider.AzureKeyVaultSecretsProvider",
+    ),
+]
+
+GCP_CLIENT_PROVIDERS_DESC = [
+    ("gcp-default", ".gcp.gs_storage_client_factory.GcpDefaultClientProvider")
+]
+
+AZURE_CLIENT_PROVIDERS_DESC = [
+    ("azure-default", ".azure.azure_credential.AzureDefaultClientProvider")
+]
+
+DEPLOYER_IMPL_PROVIDERS_DESC = [
+    ("argo-workflows", ".argo.argo_workflows_deployer.ArgoWorkflowsDeployer"),
+    (
+        "step-functions",
+        ".aws.step_functions.step_functions_deployer.StepFunctionsDeployer",
+    ),
 ]
 
 process_plugins(globals())
@@ -122,11 +174,24 @@ def get_plugin_cli():
     return resolve_plugins("cli")
 
 
+def get_plugin_cli_path():
+    return resolve_plugins("cli", path_only=True)
+
+
+def get_runner_cli():
+    return resolve_plugins("runner_cli")
+
+
+def get_runner_cli_path():
+    return resolve_plugins("runner_cli", path_only=True)
+
+
 STEP_DECORATORS = resolve_plugins("step_decorator")
 FLOW_DECORATORS = resolve_plugins("flow_decorator")
 ENVIRONMENTS = resolve_plugins("environment")
 METADATA_PROVIDERS = resolve_plugins("metadata_provider")
 DATASTORES = resolve_plugins("datastore")
+DATACLIENTS = resolve_plugins("dataclient")
 SIDECARS = resolve_plugins("sidecar")
 LOGGING_SIDECARS = resolve_plugins("logging_sidecar")
 MONITOR_SIDECARS = resolve_plugins("monitor_sidecar")
@@ -136,6 +201,13 @@ SIDECARS.update(MONITOR_SIDECARS)
 
 AWS_CLIENT_PROVIDERS = resolve_plugins("aws_client_provider")
 SECRETS_PROVIDERS = resolve_plugins("secrets_provider")
+AZURE_CLIENT_PROVIDERS = resolve_plugins("azure_client_provider")
+GCP_CLIENT_PROVIDERS = resolve_plugins("gcp_client_provider")
+
+if sys.version_info >= (3, 7):
+    DEPLOYER_IMPL_PROVIDERS = resolve_plugins("deployer_impl_provider")
+
+from .cards.card_modules import MF_EXTERNAL_CARDS
 
 # Cards; due to the way cards were designed, it is harder to make them fit
 # in the resolve_plugins mechanism. This should be OK because it is unlikely that
@@ -143,22 +215,23 @@ SECRETS_PROVIDERS = resolve_plugins("secrets_provider")
 # card should be something just for Airflow, or Argo or step-functions -- those should
 # be added externally).
 from .cards.card_modules.basic import (
-    DefaultCard,
-    TaskSpecCard,
-    ErrorCard,
     BlankCard,
+    DefaultCard,
     DefaultCardJSON,
+    ErrorCard,
+    TaskSpecCard,
 )
 from .cards.card_modules.test_cards import (
-    TestErrorCard,
-    TestTimeoutCard,
-    TestMockCard,
-    TestPathSpecCard,
     TestEditableCard,
     TestEditableCard2,
+    TestErrorCard,
+    TestMockCard,
     TestNonEditableCard,
+    TestPathSpecCard,
+    TestTimeoutCard,
+    TestRefreshCard,
+    TestRefreshComponentCard,
 )
-from .cards.card_modules import MF_EXTERNAL_CARDS
 
 CARDS = [
     DefaultCard,
@@ -174,5 +247,7 @@ CARDS = [
     TestNonEditableCard,
     BlankCard,
     DefaultCardJSON,
+    TestRefreshCard,
+    TestRefreshComponentCard,
 ]
 merge_lists(CARDS, MF_EXTERNAL_CARDS, "type")
